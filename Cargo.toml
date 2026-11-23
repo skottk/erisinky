@@ -11,6 +11,10 @@ objc2-metal = "0.3"
 block2 = "0.6"
 libc = "0.2"
 
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
