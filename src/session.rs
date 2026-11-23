@@ -578,8 +578,9 @@ impl Renderer {
         self.esc_state = EscState::Normal;
         if self.thinking && self.show_thinking {
             let _ = write!(out, "\x1b[0m");
-            self.thinking = false;
         }
+        self.thinking = false;
+        self.think_note = false;
         let _ = out.flush();
     }
 }
