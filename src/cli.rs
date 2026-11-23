@@ -15,6 +15,7 @@ commands:
   run -p TEXT       one prompt, streamed
   bench             greedy prefill + decode benchmark
   check --ref P     compare logits against a llama.cpp reference dump (tools/ref_logits)
+  verify            audit GGUF weights/scales and verify Fast vs Safe Metal math
 
 options:
   -m, --model PATH  GGUF file (default: LM Studio's Inkling-2-Mini Q4_K_M)
@@ -347,4 +348,101 @@ pub fn encode_first_turn(tk: &Tokenizer, o: &Opts, user: &str) -> Vec<u32> {
     push_special(tk, &mut out, "<|end_message|>");
     out.extend_from_slice(&encode_user_turn(tk, user));
     out
+}
+
+/// Differential comparison between `MTLMathMode::Fast` and `MTLMathMode::Safe` logits
+/// over a single step (after optional logit softcapping).
+#[derive(Debug, Clone, Copy)]
+pub struct LogitDiff {
+    pub non_finite_fast: usize,
+    pub non_finite_safe: usize,
+    pub max_abs_diff: f32,
+    pub kl_div: f32,
+    pub argmax_fast: usize,
+    pub argmax_safe: usize,
+}
+
+impl LogitDiff {
+    pub fn argmax_match(&self) -> bool {
+        self.argmax_fast == self.argmax_safe
+    }
+}
+
+fn apply_softcap(x: f32, c: f32) -> f32 {
+    if c > 0.0 && c.is_finite() {
+        c * (x / c).tanh()
+    } else {
+        x
+    }
+}
+
+/// Compare `fast` vs `safe` logit slices, counting non-finite values, max absolute
+/// difference, argmax agreement, and `KL(safe || fast)` over finite entries.
+pub fn diff_logits(fast: &[f32], safe: &[f32], softcap: f32) -> LogitDiff {
+    let n = fast.len().min(safe.len());
+    let mut non_finite_fast = 0usize;
+    let mut non_finite_safe = 0usize;
+    let mut max_abs_diff = 0.0f32;
+    let mut argmax_fast = 0usize;
+    let mut best_fast = f32::NEG_INFINITY;
+    let mut argmax_safe = 0usize;
+    let mut best_safe = f32::NEG_INFINITY;
+
+    let mut f_sc = Vec::with_capacity(n);
+    let mut s_sc = Vec::with_capacity(n);
+    for i in 0..n {
+        let fv = fast[i];
+        let sv = safe[i];
+        if !fv.is_finite() {
+            non_finite_fast += 1;
+        }
+        if !sv.is_finite() {
+            non_finite_safe += 1;
+        }
+        let fc = apply_softcap(fv, softcap);
+        let sc = apply_softcap(sv, softcap);
+        if fc.is_finite() && fc > best_fast {
+            best_fast = fc;
+            argmax_fast = i;
+        }
+        if sc.is_finite() && sc > best_safe {
+            best_safe = sc;
+            argmax_safe = i;
+        }
+        if fc.is_finite() && sc.is_finite() {
+            max_abs_diff = max_abs_diff.max((fc - sc).abs());
+        }
+        f_sc.push(fc);
+        s_sc.push(sc);
+    }
+
+    let kl_div = if non_finite_fast == 0 && non_finite_safe == 0 && n > 0 {
+        let lse = |v: &[f32]| -> f64 {
+            let m = v.iter().copied().fold(f64::NEG_INFINITY, |a, b| a.max(b as f64));
+            let s: f64 = v.iter().map(|&x| ((x as f64) - m).exp()).sum();
+            m + s.ln()
+        };
+        let lf = lse(&f_sc);
+        let ls = lse(&s_sc);
+        let kl: f64 = s_sc
+            .iter()
+            .zip(&f_sc)
+            .map(|(&sv, &fv)| {
+                let ps = ((sv as f64) - ls).exp();
+                ps * (((sv as f64) - ls) - ((fv as f64) - lf))
+            })
+            .sum();
+        kl.max(0.0) as f32
+    } else {
+        f32::NAN
+    };
+
+    LogitDiff {
+        non_finite_fast,
+        non_finite_safe,
+        max_abs_diff,
+        kl_div,
+        argmax_fast,
+        argmax_safe,
+    }
 }

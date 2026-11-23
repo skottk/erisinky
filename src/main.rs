@@ -1,10 +1,11 @@
-use inkling::cli::{self, encode_first_turn, encode_user_turn, Opts, ParseOutcome, USAGE};
+use inkling::cli::{self, diff_logits, encode_first_turn, encode_user_turn, Opts, ParseOutcome, USAGE};
 use inkling::engine::{self, Engine};
+use inkling::gguf::Gguf;
 use inkling::metal;
 use inkling::sampler::Sampler;
 use inkling::session::{Renderer, Session};
 use inkling::tokenizer::Tokenizer;
-use objc2_metal::{MTLBuffer, MTLCommandBuffer};
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLMathMode};
 use std::io::{BufRead, IsTerminal, Write};
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -462,10 +463,246 @@ fn vcost(o: &Opts) {
     }
 }
 
+/// Audit GGUF weights/scales for non-finite values and differentially verify
+/// `MTLMathMode::Fast` vs `MTLMathMode::Safe` on the local GPU + Metal driver.
+fn verify(o: &Opts) {
+    let t_audit = std::time::Instant::now();
+    let g = Gguf::open(&o.model).unwrap_or_else(|e| die(format!("open model '{}': {e}", o.model)));
+    g.validate_inkling_model()
+        .unwrap_or_else(|e| die(format!("invalid model '{}': {e}", o.model)));
+    let audit = g.audit_weights_finiteness();
+    let audit_ms = t_audit.elapsed().as_secs_f64() * 1e3;
+    drop(g);
+
+    if !audit.is_clean() {
+        if o.json {
+            println!(
+                r#"{{"schema":1,"status":"FAIL","phase":"weight_audit","tensors_checked":{},"blocks_checked":{},"non_finite_weights":{},"audit_ms":{audit_ms:.2}}}"#,
+                audit.tensors_checked, audit.blocks_checked, audit.non_finite_count
+            );
+        } else {
+            eprintln!(
+                "[verify] FAIL weight audit: {} non-finite value(s) across {} tensor(s) ({} blocks in {:.1} ms)",
+                audit.non_finite_count, audit.offenders.len(), audit.blocks_checked, audit_ms
+            );
+            for off in audit.offenders.iter().take(10) {
+                eprintln!(
+                    "  offender: {} (type {}): {} non-finite",
+                    off.tensor,
+                    inkling::gguf::type_name(off.ty),
+                    off.non_finite
+                );
+            }
+        }
+        std::process::exit(1);
+    }
+
+    let kv8 = engine::KV8.load(std::sync::atomic::Ordering::Relaxed);
+    let vctx = o.ctx.clamp(512, 2048);
+    let n_decode_steps = 4usize;
+
+    struct ProbeSpec {
+        name: &'static str,
+        raw: bool,
+        text: String,
+    }
+    let probes = vec![
+        ProbeSpec {
+            name: "short_chat",
+            raw: false,
+            text: "Write a haiku about the ocean.".into(),
+        },
+        ProbeSpec {
+            name: "t1_raw",
+            raw: true,
+            text: "Hello".into(),
+        },
+        ProbeSpec {
+            name: "repeat_stress",
+            raw: false,
+            text: "the ".repeat(64),
+        },
+        ProbeSpec {
+            name: "unicode_edge",
+            raw: false,
+            text: "∑∫√∞ café naïve 	
+ 1234567890".into(),
+        },
+    ];
+
+    struct FastTrace {
+        name: &'static str,
+        prompt: Vec<u32>,
+        gen_toks: Vec<u32>,
+        logits: Vec<Vec<f32>>,
+    }
+
+    let t_diff = std::time::Instant::now();
+    // Phase 2a: run all probes under MTLMathMode::Fast, then drop the engine before loading Safe
+    // so peak RAM never doubles.
+    let (softcap, traces): (f32, Vec<FastTrace>) = {
+        let eng = Engine::try_load_with_math_mode(&o.model, vctx, kv8, MTLMathMode::Fast)
+            .unwrap_or_else(|e| die(format!("load model (Fast) '{}': {e}", o.model)));
+        let tk = Tokenizer::load(&eng.g);
+        let mut traces = Vec::with_capacity(probes.len());
+        for p in &probes {
+            let mut prompt = if p.raw {
+                let mut t = tk.encode(&p.text, false);
+                t.truncate(1);
+                t
+            } else {
+                encode_first_turn(&tk, o, &p.text)
+            };
+            if prompt.is_empty() {
+                prompt.push(tk.eos);
+            }
+            if prompt.len() + n_decode_steps + 2 >= vctx {
+                prompt.truncate(vctx.saturating_sub(n_decode_steps + 2));
+            }
+            eng.reset();
+            eng.prepare(prompt.len(), prompt.len() + n_decode_steps + 2);
+            eng.set_tokens(0, &prompt);
+            eng.reserve(prompt.len() + n_decode_steps + 2, false);
+            eng.ensure_batch(prompt.len().min(eng.chunk));
+            let cb = eng.gpu.cmd();
+            eng.encode_prefill(&cb, 0, prompt.len(), true, true);
+            cb.commit();
+            cb.waitUntilCompleted();
+            eng.release_batch();
+
+            let mut step_logits = Vec::with_capacity(1 + n_decode_steps);
+            let mut gen_toks = Vec::with_capacity(n_decode_steps);
+            step_logits.push(eng.logits().to_vec());
+            let mut tok = eng.token_at(prompt.len());
+            let mut pos = prompt.len();
+            for _ in 0..n_decode_steps {
+                gen_toks.push(tok);
+                eng.set_tokens(pos, &[tok]);
+                eng.gen_reserve(pos);
+                let cb = eng.step(pos, true, true);
+                cb.waitUntilCompleted();
+                pos += 1;
+                step_logits.push(eng.logits().to_vec());
+                tok = eng.token_at(pos);
+            }
+            traces.push(FastTrace {
+                name: p.name,
+                prompt,
+                gen_toks,
+                logits: step_logits,
+            });
+        }
+        (eng.softcap, traces)
+    };
+
+    // Phase 2b: replay the exact same token inputs under MTLMathMode::Safe and compare logits.
+    let mut total_steps = 0usize;
+    let mut agree = 0usize;
+    let mut non_finite_fast = 0usize;
+    let mut non_finite_safe = 0usize;
+    let mut worst_max_diff = 0.0f32;
+    let mut worst_kl = 0.0f32;
+    let mut probe_summaries: Vec<(&'static str, usize, usize, f32, f32, usize)> = Vec::new();
+    {
+        let eng = Engine::try_load_with_math_mode(&o.model, vctx, kv8, MTLMathMode::Safe)
+            .unwrap_or_else(|e| die(format!("load model (Safe) '{}': {e}", o.model)));
+        for tr in &traces {
+            eng.reset();
+            eng.prepare(tr.prompt.len(), tr.prompt.len() + n_decode_steps + 2);
+            eng.set_tokens(0, &tr.prompt);
+            eng.reserve(tr.prompt.len() + n_decode_steps + 2, false);
+            eng.ensure_batch(tr.prompt.len().min(eng.chunk));
+            let cb = eng.gpu.cmd();
+            eng.encode_prefill(&cb, 0, tr.prompt.len(), true, true);
+            cb.commit();
+            cb.waitUntilCompleted();
+            eng.release_batch();
+
+            let mut p_agree = 0usize;
+            let mut p_steps = 0usize;
+            let mut p_max_diff = 0.0f32;
+            let mut p_kl = 0.0f32;
+            let mut p_nf = 0usize;
+
+            let mut record = |fast_l: &[f32], safe_l: &[f32]| {
+                let d = diff_logits(fast_l, safe_l, softcap);
+                p_steps += 1;
+                total_steps += 1;
+                if d.argmax_match() {
+                    p_agree += 1;
+                    agree += 1;
+                }
+                non_finite_fast += d.non_finite_fast;
+                non_finite_safe += d.non_finite_safe;
+                p_nf += d.non_finite_fast + d.non_finite_safe;
+                p_max_diff = p_max_diff.max(d.max_abs_diff);
+                worst_max_diff = worst_max_diff.max(d.max_abs_diff);
+                if d.kl_div.is_finite() {
+                    p_kl = p_kl.max(d.kl_div);
+                    worst_kl = worst_kl.max(d.kl_div);
+                }
+            };
+
+            record(&tr.logits[0], &eng.logits());
+            for (step_idx, &tok) in tr.gen_toks.iter().enumerate() {
+                let pos = tr.prompt.len() + step_idx;
+                eng.set_tokens(pos, &[tok]);
+                eng.gen_reserve(pos);
+                let cb = eng.step(pos, true, true);
+                cb.waitUntilCompleted();
+                record(&tr.logits[step_idx + 1], &eng.logits());
+            }
+            probe_summaries.push((tr.name, p_agree, p_steps, p_max_diff, p_kl, p_nf));
+        }
+    }
+    let diff_ms = t_diff.elapsed().as_secs_f64() * 1e3;
+
+    // Gate on zero non-finite weights/logits, 100% greedy argmax agreement, and tight
+    // probability-distribution KL(safe || fast) < 0.01 (max_diff is reported as diagnostic
+    // because deep negative tail logits or marginal 8th-expert MoE ties can shift >0.25
+    // with negligible <0.001 KL impact).
+    let passed = audit.is_clean()
+        && non_finite_fast == 0
+        && non_finite_safe == 0
+        && agree == total_steps
+        && worst_kl < 0.01;
+
+    if o.json {
+        println!(
+            r#"{{"schema":1,"status":"{}","weight_audit":{{"tensors_checked":{},"blocks_checked":{},"non_finite":{},"ms":{audit_ms:.2}}},"fast_vs_safe":{{"steps":{total_steps},"argmax_agree":{agree},"non_finite_fast":{non_finite_fast},"non_finite_safe":{non_finite_safe},"worst_max_diff":{worst_max_diff:.6},"worst_kl":{worst_kl:.6},"ms":{diff_ms:.2}}}}}"#,
+            if passed { "PASS" } else { "FAIL" },
+            audit.tensors_checked,
+            audit.blocks_checked,
+            audit.non_finite_count
+        );
+    } else {
+        println!(
+            "[verify] weight audit: PASS ({} tensors, {} blocks, 0 non-finite in {:.1} ms)",
+            audit.tensors_checked, audit.blocks_checked, audit_ms
+        );
+        for (name, pa, ps, md, kl, nf) in &probe_summaries {
+            println!(
+                "  probe {:<14}: argmax {pa}/{ps} | max_diff {md:.5} | worst_kl {kl:.6} | non_finite {nf}",
+                name
+            );
+        }
+        println!(
+            "[verify] Fast vs Safe: {} ({agree}/{total_steps} argmax agree, worst max_diff {worst_max_diff:.5}, worst KL {worst_kl:.6}, non_finite fast={non_finite_fast} safe={non_finite_safe}, {:.1} ms)",
+            if passed { "PASS" } else { "FAIL" },
+            diff_ms
+        );
+    }
+
+    if !passed {
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let (cmd, o) = parse();
     match cmd.as_str() {
         "check" => check(&o),
+        "verify" => verify(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),
         "routes" => routes(&o),
