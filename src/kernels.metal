@@ -6,6 +6,11 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 
+// Finite negative sentinel safe under MTLMathMode::Fast (avoids finite-math-only
+// miscompilation of -INFINITY / == -INFINITY while exp(NEG_INF_F - m) == 0.0f).
+constant float NEG_INF_F   = -1e30f;
+constant float NEG_INF_CMP = -1e29f;
+
 #define E      2304
 #define NH     24
 #define NKV    8
@@ -78,7 +83,7 @@ inline float tg_max(float v, threadgroup float * sh, ushort sg, ushort lane, ush
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) sh[sg] = v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float r = lane < nsg ? sh[lane] : -INFINITY;
+    float r = lane < nsg ? sh[lane] : NEG_INF_F;
     return simd_max(r);
 }
 
@@ -281,9 +286,9 @@ kernel void k_mix(device const uchar * PB [[buffer(1)]], device float * A [[buff
         for (uint i = 0; i < 6; i++) rr[i] = rsqrt(red[i * 5] / E + 1e-6f);
         #pragma unroll
         for (uint q = 0; q < 4; q++) {
-            float sc[6], mx = -INFINITY;
+            float sc[6], mx = NEG_INF_F;
             #pragma unroll
-            for (uint i = 0; i < 6; i++) { sc[i] = i < nS ? rr[i] * red[i * 5 + 1 + q] * (1.0f / 48.0f) : -INFINITY; mx = max(mx, sc[i]); }
+            for (uint i = 0; i < 6; i++) { sc[i] = i < nS ? rr[i] * red[i * 5 + 1 + q] * (1.0f / 48.0f) : NEG_INF_F; mx = max(mx, sc[i]); }
             float den = 0;
             #pragma unroll
             for (uint i = 0; i < 6; i++) { sc[i] = i < nS ? exp(sc[i] - mx) : 0.0f; den += sc[i]; }
@@ -362,7 +367,7 @@ inline void topk_sg(device float * A, device const uchar * PB, uint logits_off, 
         const float mv = simd_max(bv);
         const int win = simd_min((bv == mv) ? (int) (lane * 4 + bi) : 1 << 20);
         const float pw = simd_shuffle(pr[win % 4], (ushort) (win / 4));
-        if ((int) (lane * 4 + bi) == win) sel[bi] = -INFINITY;
+        if ((int) (lane * 4 + bi) == win) sel[bi] = NEG_INF_F;
         if (lane == (ushort) k) { myid = win; myw = pw; }
         wsum += pw;
     }
@@ -603,7 +608,7 @@ kernel void k_attn(device const uchar * PB [[buffer(1)]], device float * A [[buf
     device const float * relb = (device const float *) (PB + a.relbias_w);
     // ---- barrier-free per-simdgroup online softmax over 8-key blocks (4 lanes per key for the scores)
     const ushort kk = lane / 4, pp = lane % 4;
-    float m[3] = {-INFINITY, -INFINITY, -INFINITY}, l[3] = {0, 0, 0};
+    float m[3] = {NEG_INF_F, NEG_INF_F, NEG_INF_F}, l[3] = {0, 0, 0};
     float4 o[3] = {0, 0, 0};
     float4 rl[3];
     for (int h = 0; h < 3; h++) rl[h] = *(threadgroup const float4 *) (&rs[h][pp * 4]);
@@ -646,7 +651,7 @@ kernel void k_attn(device const uchar * PB [[buffer(1)]], device float * A [[buf
         for (int h = 0; h < 3; h++) {
             float t = acc[h];
             t += simd_shuffle_xor(t, 1); t += simd_shuffle_xor(t, 2);
-            t = valid ? t - sink[h] : -INFINITY;
+            t = valid ? t - sink[h] : NEG_INF_F;
             const float mx = max(m[h], simd_max(t));
             sc_[h] = exp(m[h] - mx);
             pr[h] = exp(t - mx);
@@ -680,11 +685,11 @@ kernel void k_attn(device const uchar * PB [[buffer(1)]], device float * A [[buf
     for (int h = 0; h < 3; h++) os_[sg][h][lane] = o[h];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int h = 0; h < 3; h++) {
-        float M = -INFINITY;
+        float M = NEG_INF_F;
         for (int s2 = 0; s2 < 4; s2++) M = max(M, ms_[s2][h]);
         float L = 0, O = 0;
         for (int s2 = 0; s2 < 4; s2++) {
-            const float w = ms_[s2][h] == -INFINITY ? 0.0f : exp(ms_[s2][h] - M);
+            const float w = ms_[s2][h] <= NEG_INF_CMP ? 0.0f : exp(ms_[s2][h] - M);
             L += w * ls_[s2][h];
             O += w * ((threadgroup const float *) os_[s2][h])[tid];
         }
@@ -758,7 +763,7 @@ kernel void k_topk(device const uchar * PB [[buffer(1)]], device float * A [[buf
         const float mv = simd_max(bv);
         const int win = simd_min((bv == mv) ? (int) (lane * 4 + bi) : 1 << 20);
         const float pw = simd_shuffle(pr[win % 4], (ushort) (win / 4));
-        if ((int) (lane * 4 + bi) == win) sel[bi] = -INFINITY;
+        if ((int) (lane * 4 + bi) == win) sel[bi] = NEG_INF_F;
         if (lane == (ushort) k) { myid = win; myw = pw; }
         wsum += pw;
     }
@@ -854,7 +859,7 @@ kernel void k_argmax1(device float * A [[buffer(2)]], constant ArgmaxArgs & a [[
                       uint tg [[threadgroup_position_in_grid]], uint ntg [[threadgroups_per_grid]], ushort tid [[thread_index_in_threadgroup]],
                       ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
     threadgroup float bv[32]; threadgroup int bi[32];
-    float best = -INFINITY; int idx = 0;
+    float best = NEG_INF_F; int idx = 0;
     for (uint i = tg * 1024 + tid; i < a.n; i += ntg * 1024) { const float v = A[a.logits_off + i]; if (v > best) { best = v; idx = i; } }
     const float m = simd_max(best);
     int c = best == m ? idx : 0x7fffffff; c = simd_min(c);
@@ -870,7 +875,7 @@ kernel void k_argmax1(device float * A [[buffer(2)]], constant ArgmaxArgs & a [[
 
 kernel void k_argmax2(device float * A [[buffer(2)]], constant ArgmaxArgs & a [[buffer(5)]], device int * toks [[buffer(6)]],
                       ushort lane [[thread_index_in_simdgroup]]) {
-    float best = -INFINITY; int idx = 0x7fffffff;
+    float best = NEG_INF_F; int idx = 0x7fffffff;
     for (uint i = lane; i < a.nparts; i += 32) {
         const float v = A[a.part_off + 2 * i]; const int ii = as_type<int>(A[a.part_off + 2 * i + 1]);
         if (v > best || (v == best && ii < idx)) { best = v; idx = ii; }

@@ -33,20 +33,21 @@ pub struct Gpu {
     /// Optional A/B benchmark override (`INK_UNRETAINED_CMD=1`); defaults to `false`
     /// (retained references) for unwind safety.
     unretained: bool,
-    /// Math mode used to compile the Metal shader library (`MTLMathMode::Safe` by default
-    /// so IEEE-754 `-INFINITY` sentinels and comparisons are preserved).
+    /// Math mode used to compile the Metal shader library (`MTLMathMode::Fast` by default
+    /// since shaders use finite sentinels `NEG_INF_F` instead of `-INFINITY`; set
+    /// `INK_SAFE_MATH=1` to force `MTLMathMode::Safe`).
     math_mode: MTLMathMode,
 }
 
 impl Gpu {
     pub fn new(src: &str, kernels: &[&str]) -> Gpu {
-        let math_mode = if std::env::var("INK_FAST_MATH")
+        let math_mode = if std::env::var("INK_SAFE_MATH")
             .map(|v| v == "1")
             .unwrap_or(false)
         {
-            MTLMathMode::Fast
-        } else {
             MTLMathMode::Safe
+        } else {
+            MTLMathMode::Fast
         };
         Self::new_with_math_mode(src, kernels, math_mode)
     }
