@@ -326,27 +326,41 @@ pub struct LoopW { pub msg_query: u32, pub down: [u32; 4], pub gain: [u32; 4], p
 
 struct Pb { data: Vec<u8> }
 impl Pb {
-    fn align(&mut self) { while self.data.len() % 256 != 0 { self.data.push(0); } }
-    fn f32(&mut self, g: &Gguf, name: &str) -> u32 {
+    fn align(&mut self) { while !self.data.len().is_multiple_of(256) { self.data.push(0); } }
+    fn try_f32(&mut self, g: &Gguf, name: &str) -> std::io::Result<u32> {
         self.align();
         let off = self.data.len() as u32;
         let t = g.tensor(name);
-        assert_eq!(t.ty, T_F32, "{name}");
-        self.data.extend_from_slice(g.bytes(t));
-        off
+        if t.ty != T_F32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tensor '{name}' expected F32, got {}", type_name(t.ty)),
+            ));
+        }
+        let raw = g.bytes(t);
+        bounds::validate_f32_bytes_finite(name, raw)?;
+        self.data.extend_from_slice(raw);
+        Ok(off)
     }
     /// F32 -> BF16 (round to nearest even). Lossless for this model's bf16-origin matrices.
-    fn bf16(&mut self, g: &Gguf, name: &str) -> u32 {
+    fn try_bf16(&mut self, g: &Gguf, name: &str) -> std::io::Result<u32> {
         self.align();
         let off = self.data.len() as u32;
         let t = g.tensor(name);
-        assert_eq!(t.ty, T_F32, "{name}");
-        for c in g.bytes(t).chunks_exact(4) {
-            let u = u32::from_le_bytes(c.try_into().unwrap());
+        if t.ty != T_F32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tensor '{name}' expected F32, got {}", type_name(t.ty)),
+            ));
+        }
+        let raw = g.bytes(t);
+        bounds::validate_f32_bytes_finite(name, raw)?;
+        for &c in raw.as_chunks::<4>().0 {
+            let u = u32::from_le_bytes(c);
             let r = u.wrapping_add(0x7FFF + ((u >> 16) & 1)) >> 16;
             self.data.extend_from_slice(&(r as u16).to_le_bytes());
         }
-        off
+        Ok(off)
     }
 }
 
@@ -936,6 +950,33 @@ pub mod bounds {
             .map_err(|_| format!("kbench last out_off {last_out_off} exceeds u32"))?;
         Ok((out_off, out_stride, total_floats))
     }
+
+    /// Validate that `bytes` is a sequence of little-endian `f32` values (length is a
+    /// multiple of 4) and that every element is finite (neither `NaN` nor `±Inf`).
+    pub fn validate_f32_bytes_finite(name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let (chunks, rem) = bytes.as_chunks::<4>();
+        if !rem.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "tensor '{name}' byte length {} is not a multiple of 4",
+                    bytes.len()
+                ),
+            ));
+        }
+        for (idx, &chunk) in chunks.iter().enumerate() {
+            let v = f32::from_le_bytes(chunk);
+            if !v.is_finite() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "tensor '{name}' contains non-finite f32 value ({v}) at element {idx}"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Engine {
@@ -947,8 +988,28 @@ impl Engine {
 
     /// Fallible version of `load_with` that validates the GGUF architecture, tensor shapes,
     /// quantization types, and byte bounds via `Gguf::validate_inkling_model()` before
-    /// allocating any Metal resources.
+    /// allocating any Metal resources. Respects `INK_SAFE_MATH=1` for selecting `MTLMathMode`.
     pub fn try_load_with(path: &str, max_ctx: usize, kv8: bool) -> std::io::Result<Engine> {
+        let math_mode = if std::env::var("INK_SAFE_MATH")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            objc2_metal::MTLMathMode::Safe
+        } else {
+            objc2_metal::MTLMathMode::Fast
+        };
+        Self::try_load_with_math_mode(path, max_ctx, kv8, math_mode)
+    }
+
+    /// Fallible engine loader with an explicit Metal `MTLMathMode` (`Fast` or `Safe`).
+    /// Validates the GGUF metadata, tensor layout, and finiteness of all F32/BF16 parameter
+    /// buffer weights before allocating Metal resources.
+    pub fn try_load_with_math_mode(
+        path: &str,
+        max_ctx: usize,
+        kv8: bool,
+        math_mode: objc2_metal::MTLMathMode,
+    ) -> std::io::Result<Engine> {
         let t0 = std::time::Instant::now();
         let g = Gguf::open(path)?;
         g.validate_inkling_model()?;
@@ -979,12 +1040,18 @@ impl Engine {
         for i in 0..N_PHYS {
             let n = |s: &str| format!("blk.{i}.{s}");
             let swa = swa_pat[i];
-            let opt_f32 = |pb: &mut Pb, s: &str| -> i32 { if g.opt(&n(s)).is_some() { pb.f32(&g, &n(s)) as i32 } else { -1 } };
-            let attn_norm = opt_f32(&mut pb, "attn_norm.weight");
-            let q_inp_norm = opt_f32(&mut pb, "attn_q_inp_norm.weight");
-            let k_inp_norm = opt_f32(&mut pb, "attn_k_inp_norm.weight");
-            let v_inp_norm = opt_f32(&mut pb, "attn_v_inp_norm.weight");
-            let attn_res_query = opt_f32(&mut pb, "attn_res_query.weight");
+            let opt_f32 = |pb: &mut Pb, s: &str| -> std::io::Result<i32> {
+                if g.opt(&n(s)).is_some() {
+                    Ok(pb.try_f32(&g, &n(s))? as i32)
+                } else {
+                    Ok(-1)
+                }
+            };
+            let attn_norm = opt_f32(&mut pb, "attn_norm.weight")?;
+            let q_inp_norm = opt_f32(&mut pb, "attn_q_inp_norm.weight")?;
+            let k_inp_norm = opt_f32(&mut pb, "attn_k_inp_norm.weight")?;
+            let v_inp_norm = opt_f32(&mut pb, "attn_v_inp_norm.weight")?;
+            let attn_res_query = opt_f32(&mut pb, "attn_res_query.weight")?;
             let n_attn_q = g.opt(&n("attn_res_query.weight")).map(|t| if t.ne.len() > 1 { t.ne[1] as u32 } else { 1 }).unwrap_or(0);
             let layer = Layer {
                 swa,
@@ -994,17 +1061,17 @@ impl Engine {
                 kconvp: g.opt(&n("attn_k_conv_proj.weight")).map(|_| qw(&g, &n("attn_k_conv_proj.weight"))),
                 vconvp: g.opt(&n("attn_v_conv_proj.weight")).map(|_| qw(&g, &n("attn_v_conv_proj.weight"))),
                 attn_norm, q_inp_norm, k_inp_norm, v_inp_norm, attn_res_query, n_attn_q,
-                ffn_res_query: pb.f32(&g, &n("ffn_res_query.weight")),
-                ffn_norm: pb.f32(&g, &n("ffn_norm.weight")),
-                q_clip: pb.f32(&g, &n("attn_q_clip.weight")),
-                rel_clip: pb.f32(&g, &n("attn_rel_clip.weight")),
-                rel_bias: pb.f32(&g, &n("attn_rel_bias.weight")),
-                k_conv: pb.f32(&g, &n("attn_k_conv.weight")),
-                v_conv: pb.f32(&g, &n("attn_v_conv.weight")),
-                attn_post_conv: pb.f32(&g, &n("attn_post_conv.weight")),
-                ffn_post_conv: pb.f32(&g, &n("ffn_post_conv.weight")),
-                router: pb.bf16(&g, &n("ffn_gate_inp.weight")),
-                exp_bias: pb.f32(&g, &n("exp_probs_b.bias")),
+                ffn_res_query: pb.try_f32(&g, &n("ffn_res_query.weight"))?,
+                ffn_norm: pb.try_f32(&g, &n("ffn_norm.weight"))?,
+                q_clip: pb.try_f32(&g, &n("attn_q_clip.weight"))?,
+                rel_clip: pb.try_f32(&g, &n("attn_rel_clip.weight"))?,
+                rel_bias: pb.try_f32(&g, &n("attn_rel_bias.weight"))?,
+                k_conv: pb.try_f32(&g, &n("attn_k_conv.weight"))?,
+                v_conv: pb.try_f32(&g, &n("attn_v_conv.weight"))?,
+                attn_post_conv: pb.try_f32(&g, &n("attn_post_conv.weight"))?,
+                ffn_post_conv: pb.try_f32(&g, &n("ffn_post_conv.weight"))?,
+                router: pb.try_bf16(&g, &n("ffn_gate_inp.weight"))?,
+                exp_bias: pb.try_f32(&g, &n("exp_probs_b.bias"))?,
                 gu: qw(&g, &n("ffn_gate_up_exps.weight")),
                 dn: qw(&g, &n("ffn_down_exps.weight")),
             };
@@ -1019,17 +1086,17 @@ impl Engine {
         for i in LOOP_START..LOOP_END {
             let n = |s: &str| format!("blk.{i}.{s}");
             let names = ["q", "k", "v", "ffn"];
-            let mut lw = LoopW { msg_query: pb.f32(&g, &n("loop_msg_query.weight")), down: [0; 4], gain: [0; 4], forget: [0; 4] };
+            let mut lw = LoopW { msg_query: pb.try_f32(&g, &n("loop_msg_query.weight"))?, down: [0; 4], gain: [0; 4], forget: [0; 4] };
             for c in 0..4 {
-                lw.down[c] = pb.bf16(&g, &n(&format!("loop_{}_ctrl_down.weight", names[c])));
-                lw.gain[c] = pb.bf16(&g, &n(&format!("loop_{}_ctrl_gain.weight", names[c])));
-                lw.forget[c] = pb.bf16(&g, &n(&format!("loop_{}_ctrl_forget.weight", names[c])));
+                lw.down[c] = pb.try_bf16(&g, &n(&format!("loop_{}_ctrl_down.weight", names[c])))?;
+                lw.gain[c] = pb.try_bf16(&g, &n(&format!("loop_{}_ctrl_gain.weight", names[c])))?;
+                lw.forget[c] = pb.try_bf16(&g, &n(&format!("loop_{}_ctrl_forget.weight", names[c])))?;
             }
             loops.push(lw);
         }
-        let tok_norm = pb.f32(&g, "token_embd_norm.weight");
-        let output_norm = pb.f32(&g, "output_norm.weight");
-        let output_res_query = pb.f32(&g, "output_res_query.weight");
+        let tok_norm = pb.try_f32(&g, "token_embd_norm.weight")?;
+        let output_norm = pb.try_f32(&g, "output_norm.weight")?;
+        let output_res_query = pb.try_f32(&g, "output_res_query.weight")?;
         let tok_embd = qw(&g, "token_embd.weight");
         let output = qw(&g, "output.weight");
         assert_eq!(tok_embd.ty, T_Q4_K);
@@ -1037,9 +1104,12 @@ impl Engine {
         let n_vocab = g.u(&a("vocab_size_unpadded")) as usize;
         let n_vocab_pad = output.rows as usize;
 
-        let src = format!("{}{}\n{}\n{}", if kv8 { "#define KV8 1\n" } else { "" }, include_str!("kernels.metal"), include_str!("prefill.metal"), include_str!("bench_kernels.metal"));
+        let src = format!("{}{}
+{}
+{}", if kv8 { "#define KV8 1
+" } else { "" }, include_str!("kernels.metal"), include_str!("prefill.metal"), include_str!("bench_kernels.metal"));
         let kvb = if kv8 { 1 } else { 2 };
-        let gpu = Gpu::new(&src, KERNELS);
+        let gpu = Gpu::new_with_math_mode(&src, KERNELS, math_mode);
         let (map, map_len) = g.raw_map().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "gguf is not mmapped")
         })?;
@@ -1832,6 +1902,29 @@ impl Engine {
     }
     pub fn logits(&self) -> Logits<'_> {
         Logits::new(self.act.borrow(), self.ar.logits as usize, self.n_vocab)
+    }
+
+    /// Read a single logit value directly from the activation buffer without copying.
+    /// Returns `f32::NAN` if `tok >= self.n_vocab`.
+    #[inline]
+    pub fn logit_at(&self, tok: usize) -> f32 {
+        if tok >= self.n_vocab {
+            return f32::NAN;
+        }
+        let buf = self.act.borrow();
+        let cap_f32 = buf.length() / std::mem::size_of::<f32>();
+        let idx = (self.ar.logits as usize)
+            .checked_add(tok)
+            .expect("logit_at offset overflow");
+        assert!(
+            idx < cap_f32,
+            "logit_at index {idx} exceeds activation buffer capacity {cap_f32} f32s"
+        );
+        let base = buf.contents().as_ptr() as *const f32;
+        // SAFETY: `buf` holds the shared `RefCell<Buf>` borrow for the duration of the read,
+        // Metal `StorageModeShared` buffers are page-aligned (>= align_of::<f32>()), and
+        // `idx < cap_f32` guarantees `base.add(idx)` is in bounds of `self.act`.
+        unsafe { *base.add(idx) }
     }
 
     /// micro-benchmark a Q4_K matvec variant over the gate_up expert weights of every layer (no cache reuse)
