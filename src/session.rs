@@ -49,9 +49,16 @@ pub struct Session<'a> {
 }
 
 #[derive(Default, Clone, Copy)]
-pub struct Stats { pub prompt_tokens: usize, pub prompt_time: Duration, pub gen_tokens: usize, pub gen_time: Duration,
-                   /// largest activation buffer (decode arena + prefill arena) any prefill needed, bytes
-                   pub peak_scratch: usize }
+pub struct Stats {
+    pub prompt_tokens: usize,
+    pub prompt_time: Duration,
+    pub gen_tokens: usize,
+    pub gen_time: Duration,
+    /// largest activation buffer (decode arena + prefill arena) any prefill needed, bytes
+    pub peak_scratch: usize,
+    /// number of decode steps where a non-finite (`NaN` or `±Inf`) logit was detected
+    pub non_finite_logits: usize,
+}
 
 impl<'a> Session<'a> {
     pub fn new(eng: &'a Engine, tk: &'a Tokenizer) -> Session<'a> {
@@ -148,6 +155,36 @@ pub trait DecodeBackend {
     fn launch_step(&self, pos: usize, argmax: bool) -> Self::Step;
     fn wait_step(&self, step: &Self::Step);
     fn token_at(&self, pos: usize) -> u32;
+    /// Read the logit for a single token ID without copying the vocabulary slice.
+    /// Defaults to `0.0` (finite) so existing mock backends compile unchanged.
+    fn logit_at(&self, _tok: usize) -> f32 {
+        0.0
+    }
+    /// Sample a token from the current logits and report whether any non-finite
+    /// logit was detected (including `Err` from all-`NaN` logits).
+    fn sample_logits_checked(&self, sampler: &mut Sampler) -> (u32, bool) {
+        let tok = self.sample_logits(sampler);
+        let bad = !self.logit_at(tok as usize).is_finite();
+        (tok, bad)
+    }
+}
+
+/// Sample from `logits` and return `(token, non_finite_detected)`.
+/// Flags `non_finite_detected = true` if `Sampler::try_sample` fails (e.g., empty or all-`NaN`),
+/// if the winning logit is non-finite, or if any logit in `logits` is non-finite.
+pub fn sample_logits_with_canary(logits: &[f32], sampler: &mut Sampler) -> (u32, bool) {
+    match sampler.try_sample(logits) {
+        Ok(tok) => {
+            let win_bad = !logits
+                .get(tok as usize)
+                .copied()
+                .unwrap_or(f32::NAN)
+                .is_finite();
+            let any_bad = win_bad || logits.iter().any(|x| !x.is_finite());
+            (tok, any_bad)
+        }
+        Err(_) => (0, true),
+    }
 }
 
 impl DecodeBackend for Engine {
@@ -155,6 +192,9 @@ impl DecodeBackend for Engine {
     fn max_ctx(&self) -> usize { self.max_ctx }
     fn release_batch(&self) { Engine::release_batch(self); }
     fn sample_logits(&self, sampler: &mut Sampler) -> u32 { sampler.sample(&self.logits()) }
+    fn sample_logits_checked(&self, sampler: &mut Sampler) -> (u32, bool) {
+        sample_logits_with_canary(&self.logits(), sampler)
+    }
     fn set_token(&self, pos: usize, tok: u32) { self.set_tokens(pos, &[tok]); }
     fn gen_reserve(&self, pos: usize) { Engine::gen_reserve(self, pos); }
     fn gen_capacity(&self) -> usize { Engine::gen_capacity(self) }
@@ -163,6 +203,7 @@ impl DecodeBackend for Engine {
     }
     fn wait_step(&self, step: &CmdGuard) { step.0.waitUntilCompleted(); }
     fn token_at(&self, pos: usize) -> u32 { Engine::token_at(self, pos) }
+    fn logit_at(&self, tok: usize) -> f32 { Engine::logit_at(self, tok) }
 }
 
 /// Mutable cursor state passed into [`generate_with_backend`].
@@ -213,8 +254,28 @@ pub fn generate_with_backend<B: DecodeBackend>(
     if max == 0 {
         return 0;
     }
+    let mut non_finite = 0usize;
+    let mut record_non_finite = |tok: u32| {
+        if non_finite == 0 {
+            eprintln!(
+                "[inkling] WARNING: non-finite logit detected (token {tok}); re-run with INK_SAFE_MATH=1 or run `inkling verify`"
+            );
+        }
+        non_finite += 1;
+    };
     let ctx_left = |n_past: usize| eng.max_ctx().saturating_sub(n_past + 1);
-    let mut tok = if sampler.greedy() { first } else { eng.sample_logits(sampler) };
+    let mut tok = if sampler.greedy() {
+        if !eng.logit_at(first as usize).is_finite() {
+            record_non_finite(first);
+        }
+        first
+    } else {
+        let (t, bad) = eng.sample_logits_checked(sampler);
+        if bad {
+            record_non_finite(t);
+        }
+        t
+    };
     let mut n = 1usize;
     let mut stop = tok == eos || !on_token(tok) || n >= max || ctx_left(*state.n_past) < 2;
     if sampler.greedy() {
@@ -239,6 +300,9 @@ pub fn generate_with_backend<B: DecodeBackend>(
                 eng.wait_step(&cb);
                 *state.n_past = pos + 1;
                 tok = eng.token_at(pos + 1);
+                if !eng.logit_at(tok as usize).is_finite() {
+                    record_non_finite(tok);
+                }
                 n += 1;
                 stop = tok == eos || !on_token(tok) || n >= max || ctx_left(*state.n_past) < 3;
                 if stop {
@@ -258,7 +322,11 @@ pub fn generate_with_backend<B: DecodeBackend>(
             let cb = eng.launch_step(*state.n_past, false);
             eng.wait_step(&cb);
             *state.n_past += 1;
-            tok = eng.sample_logits(sampler);
+            let (t, bad) = eng.sample_logits_checked(sampler);
+            tok = t;
+            if bad {
+                record_non_finite(tok);
+            }
             n += 1;
             stop = tok == eos || !on_token(tok) || n >= max || ctx_left(*state.n_past) < 2;
         }
@@ -266,6 +334,7 @@ pub fn generate_with_backend<B: DecodeBackend>(
     }
     state.stats.gen_tokens += n;
     state.stats.gen_time += t0.elapsed();
+    state.stats.non_finite_logits += non_finite;
     n
 }
 
