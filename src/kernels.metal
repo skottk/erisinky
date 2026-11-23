@@ -231,7 +231,7 @@ kernel void k_embed(device const uchar * W [[buffer(0)]], device const uchar * P
 // depth attention ("block attention residuals"): out_q = sum_i softmax_i(q . n_i / sqrt(E)) n_i, n_i = rmsnorm(s_i)
 // optionally followed by RMSNorm with a weight. q_off < 0: identity (out = raw s_0). One threadgroup per job, 256 threads.
 
-// hcopy / hout: fp16 destinations of the batched kernel (normalized copies with row stride hstride halves; (normed) outputs
+// hcopy / hout: fp16 destinations (normalized copies with row stride hstride halves; (normed) outputs
 // with row stride E halves). nof32 bit q: output q is only wanted in fp16.
 struct MixJob { uint nS, nQ; uint s_off[6]; int q_off; uint out_off[4]; int norm_off[4]; float eps; uint tstride; int ncopy[4][3]; uint pad_t;
                 int hcopy[4][3]; int hout[4]; uint hstride, nof32; };
@@ -306,13 +306,31 @@ kernel void k_mix(device const uchar * PB [[buffer(1)]], device float * A [[buff
         float t = 0; for (int g = 0; g < 24; g++) t += sh2[g][q];
         // plain RMSNorm copies (eps 1e-6, no weight) for the loop controllers' inputs
         const float rn = rsqrt(t / E + 1e-6f);
-        for (int c = 0; c < 3; c++) if (J.ncopy[q][c] >= 0) for (int k = 0; k < 3; k++) A[J.ncopy[q][c] + toff + tid + k * 768] = o[q][k] * rn;
+        for (int c = 0; c < 3; c++) {
+            if (J.ncopy[q][c] >= 0) for (int k = 0; k < 3; k++) A[J.ncopy[q][c] + toff + tid + k * 768] = o[q][k] * rn;
+            if (J.hcopy[q][c] >= 0) {
+                device half * dst = (device half *) (A + J.hcopy[q][c]) + (ulong) tgp.y * J.hstride;
+                for (int k = 0; k < 3; k++) dst[tid + k * 768] = half(o[q][k] * rn);
+            }
+        }
+        float out_v[3];
         if (J.norm_off[q] >= 0) {
             const float r = rsqrt(t / E + J.eps);
             device const float * w = (device const float *) (PB + J.norm_off[q]);
-            for (int k = 0; k < 3; k++) A[J.out_off[q] + toff + tid + k * 768] = o[q][k] * r * w[tid + k * 768];
+            #pragma unroll
+            for (int k = 0; k < 3; k++) out_v[k] = o[q][k] * r * w[tid + k * 768];
         } else {
-            for (int k = 0; k < 3; k++) A[J.out_off[q] + toff + tid + k * 768] = o[q][k];
+            #pragma unroll
+            for (int k = 0; k < 3; k++) out_v[k] = o[q][k];
+        }
+        if (J.hout[q] >= 0) {
+            device half * dst = (device half *) (A + J.hout[q]) + (ulong) tgp.y * E;
+            #pragma unroll
+            for (int k = 0; k < 3; k++) dst[tid + k * 768] = half(out_v[k]);
+        }
+        if (!((J.nof32 >> q) & 1u)) {
+            #pragma unroll
+            for (int k = 0; k < 3; k++) A[J.out_off[q] + toff + tid + k * 768] = out_v[k];
         }
     }
 }
@@ -418,7 +436,7 @@ kernel void k_norm(device const uchar * PB [[buffer(1)]], device float * A [[buf
 // loop controller: g = D . [rmsnorm(u); rmsnorm(m)]  (D: 64 x 4608 bf16). grid: nC*16 TGs of 128 threads (1 row / simdgroup)
 
 struct CtrlJob { uint u_off, m_off, d_off, out_off, gain_off, forget_off, res_out, ss_off; int norm_w; uint ctr; };
-struct CtrlArgs { uint nC; uint tstride; uint pad1, pad2; CtrlJob job[4]; };
+struct CtrlArgs { uint nC; uint tstride; float eps; uint pad; CtrlJob job[4]; };
 
 kernel void k_ctrl_down(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], constant CtrlArgs & a [[buffer(5)]],
                         uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
@@ -481,7 +499,7 @@ kernel void k_ctrl_apply(device const uchar * PB [[buffer(1)]], device float * A
     if (J.norm_w >= 0 && last_tg(CTR + J.ctr, ntg.x, tid, &flag)) {
         float t = 0;
         for (uint i = 0; i < ntg.x; i++) t += A[J.ss_off + tok * 128 + i];
-        const float r = rsqrt(t / E + 1e-6f);
+        const float r = rsqrt(t / E + a.eps);
         device const float * w = (device const float *) (PB + J.norm_w);
         for (uint i = tid; i < E; i += 256) A[J.res_out + toff + i] *= r * w[i];
     }

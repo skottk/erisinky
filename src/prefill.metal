@@ -64,17 +64,7 @@ inline void deq16(device const uchar * row, uint wtype, uint k0, thread half * o
         }
         return;
     }
-    if (wtype == 12) {          // Q4_K
-        device const block_q4_K * b = (device const block_q4_K *) row + k0 / 256;
-        const uint w = k0 % 256, j = w / 32, hp = (w % 32) / 16;
-        float sc, m;
-        scale_min_k4(j, b->scales, sc, m);
-        const float d = float(b->d) * sc, dm = float(b->dmin) * m;
-        const uint4 q = *(device const uint4 *) (b->qs + (j / 2) * 32 + hp * 16);
-        const uint sh = (j & 1) * 4;
-        thread const uchar * qb = (thread const uchar *) &q;
-        for (int i = 0; i < 16; i++) out[i] = half(d * float((qb[i] >> sh) & 0xF) - dm);
-    } else if (wtype == 14) {   // Q6_K
+    if (wtype == 14) {          // Q6_K
         device const block_q6_K * b = (device const block_q6_K *) row + k0 / 256;
         const uint w = k0 % 256, n = w / 128, g = (w % 128) / 32, l0 = w % 32;
         const float d = float(b->d) * float(b->scales[8 * n + l0 / 16 + 2 * g]);
@@ -82,24 +72,9 @@ inline void deq16(device const uchar * row, uint wtype, uint k0, thread half * o
         device const uchar * qh = b->qh + 32 * n + l0;
         const uint s4 = (g >> 1) * 4, s2 = 2 * g;
         for (int i = 0; i < 16; i++) out[i] = half(d * float(int(((ql[i] >> s4) & 0xF) | (((qh[i] >> s2) & 3) << 4)) - 32));
-    } else if (wtype == 8) {    // Q8_0
-        device const block_q8_0 * b = (device const block_q8_0 *) row + k0 / 32;
-        const float d = b->d;
-        device const char * q = b->qs + (k0 % 32);
-        for (int i = 0; i < 16; i++) out[i] = half(d * float(q[i]));
-    } else if (wtype == 6) {    // Q5_0
-        device const block_q5_0 * b = (device const block_q5_0 *) row + k0 / 32;
-        const float d = b->d;
-        const uint qh = uint(b->qh[0]) | (uint(b->qh[1]) << 8) | (uint(b->qh[2]) << 16) | (uint(b->qh[3]) << 24);
-        const bool hi = (k0 % 32) != 0;
-        for (int i = 0; i < 16; i++) {
-            const uint q = hi ? (b->qs[i] >> 4) | (((qh >> (i + 16)) & 1) << 4) : (b->qs[i] & 0xF) | (((qh >> i) & 1) << 4);
-            out[i] = half(d * float(int(q) - 16));
-        }
-    } else {                    // BF16
-        device const ushort * p = (device const ushort *) row + k0;
-        for (int i = 0; i < 16; i++) out[i] = half(bf16f(p[i]));
+        return;
     }
+    for (int i = 0; i < 16; i++) out[i] = half(0);
 }
 
 struct GSeg {
@@ -964,7 +939,7 @@ kernel void k_layout_att(device float * A [[buffer(2)]], device kv_t * KV [[buff
 
 // ---- batched loop-controller apply: out = u*(1 - tanh(f)) + tanh(g)*m, then RMSNorm(weight). grid (T, nC), 256 threads
 struct CtrlBJob { uint u_off, m_off, g_off, f_off, out_off, norm_w; int h_off; uint nof32; };   // h_off >= 0: also (nof32: only) half output
-struct CtrlBArgs { uint n; uint pad0, pad1, pad2; CtrlBJob job[4]; };
+struct CtrlBArgs { uint n; float eps; uint pad1, pad2; CtrlBJob job[4]; };
 kernel void k_ctrl_apply_b(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], constant CtrlBArgs & a [[buffer(5)]],
                            uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                            ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
@@ -980,7 +955,7 @@ kernel void k_ctrl_apply_b(device const uchar * PB [[buffer(1)]], device float *
         ss += o[k] * o[k];
     }
     ss = tg_sum(ss, sh, sg, lane, 8);
-    const float r = rsqrt(ss / E + 1e-6f);
+    const float r = rsqrt(ss / E + a.eps);
     device const float * w = (device const float *) (PB + J.norm_w);
     for (int k = 0; k < 9; k++) {
         const uint i = tid + k * 256;
