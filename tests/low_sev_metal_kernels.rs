@@ -501,63 +501,77 @@ struct TestAttnBArgs {
     pad2: u32,
 }
 
-/// Verifies that the default `Gpu::new` compiles with `MTLMathMode::Safe` and
-/// preserves IEEE-754 `-INFINITY` sentinel semantics (`isinf`, `== -INFINITY`,
-/// `exp(-INFINITY - M + 8.0f) == 0.0f`), which `MTLMathMode::Fast` broke on
-/// Apple Silicon Metal 4.0 by evaluating `exp(-INFINITY - mx + 8.0f)` to `1.0`.
+/// Verifies that the production Metal shaders contain zero `-INFINITY` sentinels
+/// and that `Gpu::new` (default `MTLMathMode::Fast`) evaluates finite sentinel
+/// masking (`NEG_INF_F = -1e30f`, `<= -1e29f`, `exp(NEG_INF_F - mx + 8.0f) == 0.0f`)
+/// cleanly without NaN or fast-math miscompilation.
 #[test]
-fn gpu_default_math_mode_preserves_neg_infinity_sentinels() {
+fn gpu_default_fast_math_with_finite_sentinels_matches_exact_zero() {
+    // Structural guard: neither shader file may reintroduce `-INFINITY` / `INFINITY` literals
+    // while compiled under MTLMathMode::Fast.
+    for (name, src) in [
+        ("src/kernels.metal", include_str!("../src/kernels.metal")),
+        ("src/prefill.metal", include_str!("../src/prefill.metal")),
+    ] {
+        let code_only: String = src
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("INFINITY"),
+            "{name} must use finite sentinels (NEG_INF_F) instead of INFINITY under MTLMathMode::Fast"
+        );
+    }
+
     let probe_src = r#"
 #include <metal_stdlib>
 using namespace metal;
-kernel void k_inf_probe(device const float * in [[buffer(0)]],
-                        device float * out [[buffer(1)]],
-                        device uint * flags [[buffer(2)]],
-                        uint tid [[thread_position_in_grid]]) {
+constant float NEG_INF_F   = -1e30f;
+constant float NEG_INF_CMP = -1e29f;
+kernel void k_sentinel_probe(device const float * in [[buffer(0)]],
+                             device float * out [[buffer(1)]],
+                             device uint * flags [[buffer(2)]],
+                             uint tid [[thread_position_in_grid]]) {
     if (tid != 0) return;
     float ms[4];
     for (int i = 0; i < 4; i++) ms[i] = in[i];
-    flags[0] = isinf(ms[0]) ? 1u : 0u;
-    // Exact k_attn line 683-689 merge pattern with all -INFINITY inputs
-    float M = -INFINITY;
+    // Exact k_attn merge pattern with all-masked NEG_INF_F inputs
+    float M = NEG_INF_F;
     for (int i = 0; i < 4; i++) M = max(M, ms[i]);
     float L = 0.0f;
     for (int i = 0; i < 4; i++) {
-        const float w = ms[i] == -INFINITY ? 0.0f : exp(ms[i] - M);
+        const float w = ms[i] <= NEG_INF_CMP ? 0.0f : exp(ms[i] - M);
         L += w;
     }
     out[0] = M;
     out[1] = L;
-    flags[1] = (ms[0] == -INFINITY) ? 1u : 0u;
-    // Exact k_attn_h masked-key pattern: exp(-INFINITY - finite + 8.0f) == 0.0f
+    flags[0] = (ms[0] <= NEG_INF_CMP) ? 1u : 0u;
+    // Exact k_attn_h masked-key pattern under Fast math: exp(NEG_INF_F - finite + 8.0f) == 0.0f
     float fin = in[4];
-    float masked = -INFINITY;
+    float masked = NEG_INF_F;
     float mx = max(fin, masked);
     out[2] = exp(masked - mx + 8.0f);
-    flags[2] = isnan(L) ? 1u : 0u;
+    // Empty-split combine against zero-logit sink (M_sink = 0.0f): exp(NEG_INF_F - 0.0f) == 0.0f
+    out[3] = exp(M - max(0.0f, M));
+    flags[1] = isnan(L) ? 1u : 0u;
 }
 "#;
-    let gpu = Gpu::new(probe_src, &["k_inf_probe"]);
+    let gpu = Gpu::new(probe_src, &["k_sentinel_probe"]);
     assert_eq!(
         gpu.math_mode(),
-        MTLMathMode::Safe,
-        "Gpu::new must default to MTLMathMode::Safe"
+        MTLMathMode::Fast,
+        "Gpu::new must default to MTLMathMode::Fast (using finite sentinels)"
     );
 
-    let input = [
-        f32::NEG_INFINITY,
-        f32::NEG_INFINITY,
-        f32::NEG_INFINITY,
-        f32::NEG_INFINITY,
-        1.25f32,
-    ];
+    let input = [-1e30f32, -1e30f32, -1e30f32, -1e30f32, 1.25f32];
     let in_buf = gpu.buffer_with(as_bytes(&input));
     let out_buf = gpu.buffer_with(as_bytes(&[0.0f32; 4]));
     let flag_buf = gpu.buffer_with(as_bytes(&[0u32; 4]));
 
     let cb = gpu.cmd();
     let enc = Enc::new(&cb);
-    enc.pso(&gpu.pso("k_inf_probe"));
+    enc.pso(&gpu.pso("k_sentinel_probe"));
     enc.buf(&in_buf, 0, 0);
     enc.buf(&out_buf, 0, 1);
     enc.buf(&flag_buf, 0, 2);
@@ -568,12 +582,12 @@ kernel void k_inf_probe(device const float * in [[buffer(0)]],
 
     let out = read_buf_f32(&out_buf, 4);
     let flags = read_buf_u32(&flag_buf, 4);
-    assert_eq!(flags[0], 1, "isinf(-INFINITY) must be true under Safe math mode");
-    assert_eq!(flags[1], 1, "(-INFINITY == -INFINITY) must be true under Safe math mode");
-    assert_eq!(flags[2], 0, "all-masked split produced NaN in L={}", out[1]);
-    assert!(out[0].is_infinite() && out[0].is_sign_negative(), "M={}", out[0]);
+    assert_eq!(flags[0], 1, "NEG_INF_F <= NEG_INF_CMP must be true under Fast math");
+    assert_eq!(flags[1], 0, "all-masked split produced NaN in L={}", out[1]);
+    assert!(out[0].is_finite() && out[0] <= -1e29f32, "M={}", out[0]);
     assert_eq!(out[1], 0.0f32, "empty split L must be 0.0, got {}", out[1]);
-    assert_eq!(out[2], 0.0f32, "masked exp must be 0.0, got {}", out[2]);
+    assert_eq!(out[2], 0.0f32, "masked k_attn_h exp must be 0.0, got {}", out[2]);
+    assert_eq!(out[3], 0.0f32, "empty split combine weight must be 0.0, got {}", out[3]);
 }
 
 /// Exercises real `k_attn` with an empty split (`sp = 1` has 0 keys so all 4 simdgroups
@@ -705,12 +719,12 @@ fn real_attention_kernels_handle_masked_and_empty_splits_without_nan() {
 
         let got = read_buf_f32(&a_buf, a_host.len());
 
-        // Split 1 partial stats must have M = -INFINITY, L = 0.0 (zero NaNs)
+        // Split 1 partial stats must have finite M <= -1e29f, L = 0.0 (zero NaNs)
         for h in 0..NH {
             let p1 = part_off as usize + (h * nsplit + 1) * (HD + 2);
             assert!(
-                got[p1].is_infinite() && got[p1].is_sign_negative(),
-                "empty split M for head {h} should be -inf, got {}",
+                got[p1].is_finite() && got[p1] <= -1e29f32,
+                "empty split M for head {h} should be finite NEG_INF_F (<= -1e29), got {}",
                 got[p1]
             );
             assert_eq!(got[p1 + 1], 0.0, "empty split L for head {h} should be 0.0");
