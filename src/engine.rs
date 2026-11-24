@@ -156,9 +156,12 @@ struct Seg {
 struct MvArgs { nseg: u32, eps: f32, post: u32, ctr: u32, bias_off: u32, sel_off: u32, wscale: f32, pad: u32, seg: [Seg; 12] }
 
 #[repr(C)] #[derive(Clone, Copy, Default)]
-struct CtrlJob { u_off: u32, m_off: u32, d_off: u32, out_off: u32, gain_off: u32, forget_off: u32, res_out: u32, ss_off: u32, norm_w: i32, ctr: u32 }
+pub struct CtrlJob {
+    pub u_off: u32, pub m_off: u32, pub d_off: u32, pub out_off: u32, pub gain_off: u32,
+    pub forget_off: u32, pub res_out: u32, pub ss_off: u32, pub norm_w: i32, pub ctr: u32,
+}
 #[repr(C)] #[derive(Clone, Copy, Default)]
-struct CtrlArgs { n_c: u32, tstride: u32, pad: [u32; 2], job: [CtrlJob; 4] }
+pub struct CtrlArgs { pub n_c: u32, pub tstride: u32, pub pad: [u32; 2], pub job: [CtrlJob; 4] }
 
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct AttnArgs {
@@ -202,13 +205,16 @@ struct MoeGemmHArgs {
     tiles_off: u32, ntiles_off: u32, out_off: u32, ldo: u32, situ: u32, aw_off: u32, beta: f32, lbeta: f32,
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
-struct CtrlBJob { u_off: u32, m_off: u32, g_off: u32, f_off: u32, out_off: u32, norm_w: u32, h_off: i32, nof32: u32 }
+pub struct CtrlBJob {
+    pub u_off: u32, pub m_off: u32, pub g_off: u32, pub f_off: u32,
+    pub out_off: u32, pub norm_w: u32, pub h_off: i32, pub nof32: u32,
+}
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct CtrlGfJob { gain_w: u32, forget_w: u32, gh_off: u32, u_off: u32, m_off: u32, raw_off: u32, pad: [u32; 2] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct CtrlGfArgs { t: u32, njobs: u32, pad: [u32; 2], job: [CtrlGfJob; 4] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
-struct CtrlBArgs { n: u32, pad: [u32; 3], job: [CtrlBJob; 4] }
+pub struct CtrlBArgs { pub n: u32, pub pad: [u32; 3], pub job: [CtrlBJob; 4] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct GemmArgs { nseg: u32, t: u32, pad: [u32; 2], seg: [GSeg; 10] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
@@ -562,6 +568,288 @@ pub fn slot_of(pass: usize, ip: usize) -> usize {
     if pass == 0 || !(LOOP_START..LOOP_END).contains(&ip) { ip } else { N_PHYS + (pass - 1) * (LOOP_END - LOOP_START) + (ip - LOOP_START) }
 }
 
+/// Pure KV-tier math helpers exposed for CPU unit/property testing without a GPU.
+pub mod tier_math {
+    use super::{EXT, HD, KPS_CHUNK, MAX_SPLIT, NKV, N_SLOT, REC};
+
+    pub fn clamp_tier_piece_bytes(mib: usize) -> usize {
+        mib.max(1).saturating_mul(1usize << 20)
+    }
+
+    pub fn clamp_tier_threads(n: usize) -> usize {
+        n.max(1)
+    }
+
+    pub fn clamp_tier_min(n: usize) -> usize {
+        n.max(1)
+    }
+
+    pub fn clamp_split_target(n: usize) -> usize {
+        n.clamp(1, MAX_SPLIT)
+    }
+
+    pub fn tier_needs_gpu_drain(upto: usize, done: usize) -> bool {
+        upto > done
+    }
+
+    pub fn split_kps(nk: usize, split_target: usize) -> usize {
+        let st = clamp_split_target(split_target);
+        KPS_CHUNK * nk.div_ceil(KPS_CHUNK * st).max(1)
+    }
+
+    pub fn kv_exact_bytes(n: usize, n_swa: usize) -> usize {
+        let n_swa = n_swa.min(N_SLOT);
+        n_swa
+            .saturating_mul(n.min(EXT))
+            .saturating_add((N_SLOT - n_swa).saturating_mul(n))
+            .saturating_mul(REC)
+    }
+
+    pub fn tier_targets(
+        n: usize,
+        n_swa: usize,
+        split_target: usize,
+        hot_override: Option<usize>,
+    ) -> (usize, usize, usize) {
+        // Size staging for the next 64-token gen_reserve checkpoint so `half_recs >= split_kps(pos)`
+        // stays invariant across every step even above 32K context.
+        let s_min = 2usize
+            .saturating_mul(split_kps(n.saturating_add(64), split_target))
+            .saturating_mul(REC);
+        if let Some(h) = hot_override {
+            let h = h.max(64);
+            return (h, h, (2usize << 20).max(s_min));
+        }
+        let c = kv_exact_bytes(n, n_swa);
+        let s = (((c / 16) >> 20).clamp(2, 32) << 20).max(s_min);
+        if c == 0 {
+            return (64, 64, s);
+        }
+        let hot = (c / 2).saturating_sub(s);
+        let hs = (((n.min(EXT) as u128 * hot as u128) / c as u128) as usize / 64 * 64).max(64);
+        let hf = (((n as u128 * hot as u128) / c as u128) as usize / 64 * 64).max(64);
+        (hs, hf, s)
+    }
+
+    pub fn plan_read_parts(
+        jobs: &[(u64, usize, usize)],
+        piece_bytes: usize,
+    ) -> Vec<(u64, usize, usize)> {
+        let piece = piece_bytes.max(1);
+        let mut parts = Vec::new();
+        for &(off, bytes, dst) in jobs {
+            let mut o = 0usize;
+            while o < bytes {
+                let n = (bytes - o).min(piece);
+                parts.push((off + o as u64, n, dst + o));
+                o += n;
+            }
+        }
+        parts
+    }
+
+    pub fn tier_foff(kind: usize, i: usize, p: usize, n_swa: usize, max_ctx: usize) -> u64 {
+        ((if kind == 0 { i * EXT + p % EXT } else { n_swa * EXT + i * max_ctx + p }) * REC) as u64
+    }
+
+    pub fn tier_pieces(kind: usize, i: usize, a: usize, b: usize, n_swa: usize, max_ctx: usize) -> Vec<(u64, usize)> {
+        let mut v = Vec::new();
+        let mut p = a;
+        while p < b {
+            let e = if kind == 0 { b.min((p / EXT + 1) * EXT) } else { b };
+            v.push((tier_foff(kind, i, p, n_swa, max_ctx), e - p));
+            p = e;
+        }
+        v
+    }
+
+    pub fn rows_to_rec(src: &[u8], i: usize, cap: usize, idx: usize, rec: &mut [u8]) {
+        assert!(rec.len() >= REC);
+        for r in 0..2 * NKV {
+            let off = ((i * 2 * NKV + r) * cap + idx) * HD * 2;
+            rec[r * HD * 2..(r + 1) * HD * 2].copy_from_slice(&src[off..off + HD * 2]);
+        }
+    }
+
+    pub fn rec_to_rows(rec: &[u8], dst: &mut [u8], i: usize, cap: usize, idx: usize) {
+        assert!(rec.len() >= REC);
+        for r in 0..2 * NKV {
+            let off = ((i * 2 * NKV + r) * cap + idx) * HD * 2;
+            dst[off..off + HD * 2].copy_from_slice(&rec[r * HD * 2..(r + 1) * HD * 2]);
+        }
+    }
+}
+
+/// Pure buffer-bounds validators shared by `Engine` methods and CPU unit tests.
+pub mod bounds {
+    pub fn validate_set_tokens(
+        start: usize,
+        toks: &[u32],
+        max_ctx: usize,
+        vocab_rows: u32,
+    ) -> Result<(), String> {
+        let cap = max_ctx
+            .checked_add(8)
+            .ok_or_else(|| format!("set_tokens capacity overflow (max_ctx={max_ctx})"))?;
+        let end = start.checked_add(toks.len()).ok_or_else(|| {
+            format!(
+                "set_tokens range overflow (start={start}, len={})",
+                toks.len()
+            )
+        })?;
+        if end > cap {
+            return Err(format!(
+                "set_tokens range [{start}..{end}) exceeds token buffer capacity {cap} (max_ctx={max_ctx})"
+            ));
+        }
+        for (i, &tok) in toks.iter().enumerate() {
+            if tok >= vocab_rows || tok > i32::MAX as u32 {
+                return Err(format!(
+                    "set_tokens token[{i}]={tok} out of range (vocab_rows={vocab_rows})"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_token_at(idx: usize, max_ctx: usize) -> Result<(), String> {
+        let cap = max_ctx
+            .checked_add(8)
+            .ok_or_else(|| format!("token_at capacity overflow (max_ctx={max_ctx})"))?;
+        if idx >= cap {
+            return Err(format!(
+                "token_at index {idx} out of bounds (capacity {cap}, max_ctx={max_ctx})"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_arena_range(
+        off: usize,
+        n: usize,
+        act_floats: usize,
+    ) -> Result<(), String> {
+        let end = off
+            .checked_add(n)
+            .ok_or_else(|| format!("arena offset + length overflow (off={off}, n={n})"))?;
+        if end > act_floats {
+            return Err(format!(
+                "arena slice [{off}..{end}) exceeds buffer capacity {act_floats}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_restore_kv_len(src_len: usize, dst_len: usize) -> Result<(), String> {
+        if src_len > dst_len {
+            return Err(format!(
+                "restore KV buffer length {src_len} exceeds destination capacity {dst_len}"
+            ));
+        }
+        if src_len != dst_len {
+            return Err(format!(
+                "restore KV buffer length {src_len} does not match destination capacity {dst_len}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_restore_range(
+        cs_src_len: usize,
+        cs_dst_len: usize,
+        kv_src_len: usize,
+        kv_dst_len: usize,
+    ) -> Result<(), String> {
+        if cs_src_len > cs_dst_len {
+            return Err(format!(
+                "restore conv-state length {cs_src_len} exceeds destination capacity {cs_dst_len}"
+            ));
+        }
+        if cs_src_len != cs_dst_len {
+            return Err(format!(
+                "restore conv-state length {cs_src_len} does not match destination capacity {cs_dst_len}"
+            ));
+        }
+        validate_restore_kv_len(kv_src_len, kv_dst_len)
+    }
+
+    pub fn validate_kbench_t(t: usize, chunk: usize) -> Result<(), String> {
+        if t == 0 {
+            return Err("kbench token count t must be > 0".into());
+        }
+        if t > chunk {
+            return Err(format!(
+                "kbench token count t={t} exceeds chunk capacity {chunk}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_kbench_output_buf(
+        t: usize,
+        out_rows: usize,
+        buf_floats: usize,
+    ) -> Result<(), String> {
+        let need = t.checked_mul(out_rows).ok_or_else(|| {
+            format!("kbench output size overflow (t={t}, out_rows={out_rows})")
+        })?;
+        if need > buf_floats {
+            return Err(format!(
+                "kbench output requires {need} floats (t={t} * out_rows={out_rows}) but buffer holds {buf_floats}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compute `(out_off, out_stride, total_floats)` in 32-bit float units for a dedicated
+    /// benchmark scratch buffer holding `t * in_dim` inputs (fp16 if `half_in`, else f32)
+    /// followed by `n_out_bufs` output matrices of `t * out_rows` f32s each.
+    pub fn kbench_scratch_layout(
+        t: usize,
+        in_dim: usize,
+        out_rows: usize,
+        half_in: bool,
+        n_out_bufs: usize,
+    ) -> Result<(u32, usize, usize), String> {
+        if t == 0 || in_dim == 0 || out_rows == 0 || n_out_bufs == 0 {
+            return Err(format!(
+                "kbench scratch dimensions must be non-zero (t={t}, in_dim={in_dim}, out_rows={out_rows}, n_out_bufs={n_out_bufs})"
+            ));
+        }
+        let in_elems = t
+            .checked_mul(in_dim)
+            .ok_or_else(|| format!("kbench input size overflow (t={t}, in_dim={in_dim})"))?;
+        let in_floats = if half_in { in_elems.div_ceil(2) } else { in_elems };
+        let align64 = |n: usize| -> Result<usize, String> {
+            n.checked_add(63)
+                .map(|v| v / 64 * 64)
+                .ok_or_else(|| format!("kbench alignment overflow ({n})"))
+        };
+        let out_off_usize = align64(in_floats)?;
+        let out_off = u32::try_from(out_off_usize)
+            .map_err(|_| format!("kbench out_off {out_off_usize} exceeds u32"))?;
+        let out_elems = t
+            .checked_mul(out_rows)
+            .ok_or_else(|| format!("kbench output size overflow (t={t}, out_rows={out_rows})"))?;
+        let out_stride = align64(out_elems)?;
+        let total_out = out_stride
+            .checked_mul(n_out_bufs)
+            .ok_or_else(|| format!("kbench total output overflow (n_out_bufs={n_out_bufs})"))?;
+        let total_floats = out_off_usize
+            .checked_add(total_out)
+            .ok_or_else(|| "kbench total scratch floats overflow".to_string())?;
+        total_floats
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "kbench total scratch bytes overflow".to_string())?;
+        let last_out_off = out_off_usize
+            .checked_add(out_stride * (n_out_bufs - 1))
+            .ok_or_else(|| "kbench output offset overflow".to_string())?;
+        u32::try_from(last_out_off)
+            .map_err(|_| format!("kbench last out_off {last_out_off} exceeds u32"))?;
+        Ok((out_off, out_stride, total_floats))
+    }
+}
+
 impl Engine {
     pub fn load(path: &str, max_ctx: usize) -> Engine { Engine::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed)) }
     /// `kv8`: keep the K/V cache as 8-bit integers with a per-vector scale (half the memory, not exact) instead of fp16
@@ -664,11 +952,11 @@ impl Engine {
         let src = format!("{}{}\n{}\n{}", if kv8 { "#define KV8 1\n" } else { "" }, include_str!("kernels.metal"), include_str!("prefill.metal"), include_str!("bench_kernels.metal"));
         let kvb = if kv8 { 1 } else { 2 };
         let gpu = Gpu::new(&src, KERNELS);
-        let (map_ptr, map_len) = g.raw_map().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "GGUF must be backed by mmap")
+        let (map, map_len) = g.raw_map().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "gguf is not mmapped")
         })?;
-        let w = gpu.buffer_nocopy(map_ptr, map_len);
-        pb.data.extend(std::iter::repeat(0u8).take(128 * NREL * 4));   // k_attn_h reads up to 95 rows past a relative-bias table
+        let w = gpu.buffer_nocopy(map, map_len);
+        pb.data.extend(std::iter::repeat_n(0u8, 128 * NREL * 4));   // k_attn_h reads up to 95 rows past a relative-bias table
         let pbuf = gpu.buffer_with(&pb.data);
 
         let max_split = MAX_SPLIT;
@@ -704,7 +992,7 @@ impl Engine {
         let tier = if KV_DISK.load(std::sync::atomic::Ordering::Relaxed) {
             let file = create_kv_disk_file_in(&std::env::temp_dir())?;
             Some(Tier { file, on: Cell::new(false), lo: Default::default(), cold: Default::default(), filed: Default::default(), next: Cell::new(0),
-                        min_n: std::env::var("INK_TIER_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
+                        min_n: tier_math::clamp_tier_min(std::env::var("INK_TIER_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512)),
                         stg: RefCell::new(gpu.buffer(16384)), half: Cell::new(0), pending: RefCell::new([None, None]),
                         plan: RefCell::new(Vec::new()), execs: RefCell::new(Vec::new()), loaded: Cell::new(usize::MAX),
                         read_bytes: Cell::new(0), read_time: Cell::new(Default::default()), unaligned: Cell::new(false) })
@@ -768,8 +1056,8 @@ impl Engine {
             if need <= old { return; }
             // slack for the tokens about to be generated: INK_HEADROOM=a,b -> need/a (at least b positions)
             let (hd, hm) = std::env::var("INK_HEADROOM").ok().and_then(|v| v.split_once(',').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))).unwrap_or((16, 0));
-            let want = if headroom { need + (need / hd).max(hm) } else { need };
-            let cap = (want.div_ceil(64) * 64).min(limit);
+            let cap = (if headroom { need + (need / hd).max(hm) } else { need }).div_ceil(64) * 64;
+            let cap = cap.min(limit);
             let eb = self.kvb;
             let nb = self.gpu.buffer(nslots * 2 * NKV * cap * HD * eb);
             // every (slot, K|V, group) row block moves to its place in the larger layout
@@ -834,7 +1122,7 @@ impl Engine {
     /// what the cache would hold in memory for `n` positions without the tier, bytes
     pub fn kv_exact_bytes(&self, n: usize) -> usize {
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
-        (n_swa * n.min(EXT) + (N_SLOT - n_swa) * n) * REC
+        tier_math::kv_exact_bytes(n, n_swa)
     }
     /// bytes of the cache that are on disk only (read back for every token)
     pub fn kv_disk_bytes(&self, n: usize) -> usize {
@@ -849,22 +1137,25 @@ impl Engine {
     /// hot ring sizes (positions) and staging bytes for a context of `n` positions: together at most half of what the
     /// cache would take in memory
     fn tier_targets(&self, n: usize) -> (usize, usize, usize) {
-        // dev: INK_TIER_HOT=positions forces small hot rings so short tests exercise the file
-        if let Some(h) = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok()) { return (h, h, 2 << 20); }
-        let c = self.kv_exact_bytes(n);
-        // staging: two halves, each at least one split of the longest attention (see `step`)
-        let s = (((c / 16) >> 20).clamp(2, 32) << 20).max(2 * Self::split_kps(n) * REC);
-        let hot = (c / 2).saturating_sub(s);
-        ((n.min(EXT) * hot / c / 64 * 64).max(64), (n * hot / c / 64 * 64).max(64), s)
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        // dev: INK_TIER_HOT=positions forces small hot rings so short tests exercise the file (clamped >= 64)
+        let hot_override = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok());
+        tier_math::tier_targets(n, n_swa, Self::split_target(), hot_override)
     }
     fn tier_foff(&self, kind: usize, i: usize, p: usize) -> u64 {
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
         ((if kind == 0 { i * EXT + p % EXT } else { n_swa * EXT + i * self.max_ctx + p }) * REC) as u64
     }
-    fn split_target() -> usize { std::env::var("INK_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize) }
+    fn split_target() -> usize {
+        tier_math::clamp_split_target(
+            std::env::var("INK_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize),
+        )
+    }
     /// keys per split of a decode attention over `nk` keys (the same division with and without the disk tier, so both sum
     /// the same keys in the same order)
-    fn split_kps(nk: usize) -> usize { KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()).max(nk.div_ceil(KPS_CHUNK * MAX_SPLIT)) }
+    fn split_kps(nk: usize) -> usize {
+        tier_math::split_kps(nk, Self::split_target())
+    }
     /// file pieces (offset, positions) that hold positions [a, b) of a slot, in position order (a sliding-window slot's
     /// file is a ring of one window)
     fn tier_pieces(&self, kind: usize, i: usize, a: usize, b: usize) -> Vec<(u64, usize)> {
@@ -905,16 +1196,23 @@ impl Engine {
     fn tier_read(&self, jobs: &[(u64, usize, *mut u8)]) {
         let t = self.tier.as_ref().unwrap();
         let t0 = std::time::Instant::now();
-        let piece: usize = std::env::var("INK_TIER_PIECE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4) << 20;
-        let nthreads: usize = std::env::var("INK_TIER_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
-        let mut parts: Vec<(u64, usize, usize)> = Vec::new();        // (file offset, bytes, destination address)
-        for &(off, bytes, dst) in jobs {
-            let mut o = 0;
-            while o < bytes { let n = (bytes - o).min(piece); parts.push((off + o as u64, n, dst as usize + o)); o += n; }
-        }
+        let piece = tier_math::clamp_tier_piece_bytes(
+            std::env::var("INK_TIER_PIECE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4),
+        );
+        let nthreads = tier_math::clamp_tier_threads(
+            std::env::var("INK_TIER_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+        );
+        let addr_jobs: Vec<(u64, usize, usize)> = jobs
+            .iter()
+            .map(|&(off, bytes, dst)| (off, bytes, dst as usize))
+            .collect();
+        let parts = tier_math::plan_read_parts(&addr_jobs, piece);
         let total: usize = parts.iter().map(|p| p.1).sum();
         let file = &t.file;
         let read = |&(off, n, dst): &(u64, usize, usize)| {
+            // SAFETY: Each `job` targets a disjoint slice within the currently-idle staging half
+            // of `t.stg` (`tier_load` waited for the prior GPU command buffer using that half),
+            // and `plan_read_parts` partitions each job into non-overlapping `[dst, dst + n)` ranges.
             let sl = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, n) };
             file.read_exact_at(sl, off).expect("read the K/V file");
         };
@@ -1043,8 +1341,12 @@ impl Engine {
     }
     /// One decode step, committed: returns the command buffer whose completion means the step is done.
     pub fn step(&self, pos: usize, logits: bool, argmax: bool) -> CmdBuf {
-        let cb = self.gpu.cmd();
-        if !self.tier_on() { self.encode_step(&cb, pos, logits, argmax); cb.commit(); return cb; }
+        if !self.tier_on() {
+            let cb = self.gpu.cmd();
+            self.encode_step(&cb, pos, logits, argmax);
+            cb.commit();
+            return cb;
+        }
         let t = self.tier.as_ref().unwrap();
         // Rows this step overwrites go to the file first - in fact one split earlier than that (and in batches of 16), so the
         // keys around the hot ring's start are in both places. Rows older than 32 steps are final (2 steps are in flight).
@@ -1057,12 +1359,17 @@ impl Engine {
             let want = (lo + Self::split_kps(if kind == 0 { (pos + 1).min(EXT) } else { pos + 1 })).min(done).max(need);
             if t.cold[kind].get() < want {
                 let upto = (want + 15).min(done).max(want);
+                if tier_math::tier_needs_gpu_drain(upto, done) {
+                    // Safety net: wait for all in-flight GPU KV writes before reading from the hot ring on CPU.
+                    self.gpu.drain();
+                }
                 self.tier_write(kind, t.cold[kind].get().max(t.filed[kind].get()), upto, |p| p % cap);
                 t.cold[kind].set(upto);
                 t.filed[kind].set(upto.max(t.filed[kind].get()));
             }
             t.lo[kind].set(lo);
         }
+        let cb = self.gpu.cmd();
         // Plan this step's file reads: per layer execution the splits older than its hot ring, packed into staging halves.
         // The layer's keys are divided into splits exactly as without the tier (same kps from the window start); the file
         // supplies whole splits up to a boundary b that the hot ring also reaches, so every split sums the same keys in the
@@ -1095,7 +1402,7 @@ impl Engine {
                 // (tiny hot rings in tests) no common boundary: divide the file part and the hot part separately - the same
                 // keys, summed in a different grouping
                 if lo > w0 && !t.unaligned.replace(true) { eprintln!("[inkling] --kv-disk: hot ring shorter than a split, sums are grouped differently from the in-memory path"); }
-                let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
+                let spl = |nk: usize| { let kps = Self::split_kps(nk); (kps, nk.div_ceil(kps)) };
                 let (mut c, mut sp) = (w0, 0usize);
                 while c < lo {
                     if room < (lo - c).min(64) { round += 1; room = half_recs; }
@@ -1168,9 +1475,15 @@ impl Engine {
         (g(&self.cs), g(&self.kv_swa.borrow()))
     }
     pub fn restore(&self, s: &(Vec<u8>, Vec<u8>)) {
+        let kv = self.kv_swa.borrow();
+        bounds::validate_restore_range(s.0.len(), self.cs.length(), s.1.len(), kv.length())
+            .unwrap_or_else(|e| panic!("{e}"));
+        // SAFETY: `validate_restore_range` verified `s.0.len() == self.cs.length()` and
+        // `s.1.len() == kv.length()`. `s.0` and `s.1` are heap `Vec<u8>`s disjoint from the
+        // Metal shared buffers `self.cs` and `kv`.
         unsafe {
             std::ptr::copy_nonoverlapping(s.0.as_ptr(), self.cs.contents().as_ptr() as *mut u8, s.0.len());
-            std::ptr::copy_nonoverlapping(s.1.as_ptr(), self.kv_swa.borrow().contents().as_ptr() as *mut u8, s.1.len());
+            std::ptr::copy_nonoverlapping(s.1.as_ptr(), kv.contents().as_ptr() as *mut u8, s.1.len());
         }
     }
     /// Score every far key (older than one window at context `n`) of the full-attention slots by the attention it received
@@ -1283,7 +1596,7 @@ impl Engine {
                 cnt += 1;
             } }
         }
-        margins.iter().zip(within).map(|(&m, (s, w))| (m, s / cnt as f64, w)).collect()
+        margins.iter().zip(within).map(|(&m, (s, w))| (m, if cnt == 0 { 0.0 } else { s / cnt as f64 }, w)).collect()
     }
     /// dev: what would storing the cache at `bits` per value cost in accuracy? Rounds the keys and values of positions
     /// [from, to) in place to a per-vector linear grid (the storage stays fp16; nothing gets smaller). kbits / vbits = 0: untouched.
@@ -1304,14 +1617,12 @@ impl Engine {
             let base = buf.contents().as_ptr() as *mut u16;
             for (b, bits) in [(kb, kbits), (vb, vbits)] {
                 if bits == 0 { continue; }
-                let lv = ((1u32 << (bits - 1)) - 1) as f32;
                 for g in 0..NKV { for pos in from.max(if is_swa { to.saturating_sub(EXT) } else { 0 })..to {
                     let idx = if is_swa { pos % cap as usize } else { pos };
+                    // SAFETY: `b` + `(g * cap + idx) * HD + HD` lies within the slot's allocated fp16 KV buffer.
                     let row = unsafe { std::slice::from_raw_parts_mut(base.add(b as usize + (g * cap as usize + idx) * HD), HD) };
                     let v: Vec<f32> = row.iter().map(|&h| h2f(h)).collect();
                     if bits >= 100 {
-                        // floating formats: 100 + m = round every value to m mantissa bits; 200 + m = the same with a 3-bit exponent
-                        // (binades [0.25, 32), fixed step 2^-(m+2) below)
                         let (m, lim) = ((bits % 100) as i32, bits >= 200);
                         for (r, &x) in row.iter_mut().zip(&v) {
                             if x == 0.0 { continue; }
@@ -1324,6 +1635,7 @@ impl Engine {
                         }
                         continue;
                     }
+                    let lv = ((1u32 << (bits - 1)) - 1) as f32;
                     let mx = v.iter().fold(0f32, |a, x| a.max(x.abs()));
                     if mx == 0.0 { continue; }
                     for (r, x) in row.iter_mut().zip(&v) { *r = f2h((x / mx * lv).round() * mx / lv); }
@@ -1355,11 +1667,29 @@ impl Engine {
     }
 
     pub fn set_tokens(&self, start: usize, toks: &[u32]) {
+        bounds::validate_set_tokens(start, toks, self.max_ctx, self.tok_embd.rows)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let cap = self.toks.length() / std::mem::size_of::<i32>();
+        assert!(
+            start + toks.len() <= cap,
+            "set_tokens range [{start}..{}) exceeds backing buffer capacity {cap}",
+            start + toks.len()
+        );
         let p = self.toks.contents().as_ptr() as *mut i32;
-        for (i, &t) in toks.iter().enumerate() { unsafe { *p.add(start + i) = t as i32; } }
+        for (i, &t) in toks.iter().enumerate() {
+            // SAFETY: `validate_set_tokens` and the backing-buffer check above guarantee
+            // `start + i < cap` (`self.toks` holds `cap` `i32`s) and `t <= i32::MAX as u32`.
+            unsafe { *p.add(start + i) = t as i32; }
+        }
     }
     pub fn arena(&self, off: u32, n: usize) -> Vec<f32> {
-        unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off as usize), n).to_vec() }
+        let buf = self.act.borrow();
+        let cap_f32 = buf.length() / std::mem::size_of::<f32>();
+        bounds::validate_arena_range(off as usize, n, cap_f32)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // SAFETY: `buf` keeps the `RefCell<Buf>` borrowed and `validate_arena_range`
+        // verified `off as usize + n <= cap_f32`.
+        unsafe { std::slice::from_raw_parts((buf.contents().as_ptr() as *const f32).add(off as usize), n).to_vec() }
     }
     /// expert ids chosen by each of the 48 layer executions of the last decode step
     pub fn routes(&self) -> Vec<[u8; TOPK]> {
@@ -1419,7 +1749,14 @@ impl Engine {
         }
         true
     }
-    pub fn token_at(&self, i: usize) -> u32 { unsafe { *(self.toks.contents().as_ptr() as *const i32).add(i) as u32 } }
+    pub fn token_at(&self, i: usize) -> u32 {
+        bounds::validate_token_at(i, self.max_ctx).unwrap_or_else(|e| panic!("{e}"));
+        let cap = self.toks.length() / std::mem::size_of::<i32>();
+        assert!(i < cap, "token_at index {i} exceeds backing buffer capacity {cap}");
+        // SAFETY: `validate_token_at` and the backing-buffer check above guarantee `i < cap`,
+        // where `self.toks` holds `cap` `i32` elements.
+        unsafe { *(self.toks.contents().as_ptr() as *const i32).add(i) as u32 }
+    }
     pub fn logits(&self) -> Logits<'_> {
         Logits::new(self.act.borrow(), self.ar.logits as usize, self.n_vocab)
     }
@@ -1462,6 +1799,7 @@ impl Engine {
         let ar = self.ar;
         // synthetic act + selection
         let a = self.act.borrow().contents().as_ptr() as *mut f32;
+        // SAFETY: `ar.act + TOPK * FF` and `ar.sel + 2 * TOPK` are allocated in the decode arena.
         unsafe {
             for i in 0..TOPK * FF { *a.add(ar.act as usize + i) = ((i * 7919) % 1000) as f32 / 1000.0 - 0.5; }
             for k in 0..TOPK { *a.add(ar.sel as usize + TOPK + k) = 0.125; }
@@ -1488,6 +1826,7 @@ impl Engine {
                     bytes += TOPK * E * dn.row_bytes as usize;
                 }
             }
+            // SAFETY: each `so` lies within the `ar.logits` scratch region of the decode arena.
             unsafe {
                 for (j, &so) in sels.iter().enumerate() {
                     for k in 0..TOPK { *a.add(so as usize + k) = (((j * 37 + k * 13 + rep * 5) % 128) as f32).max(0.0); *a.add(so as usize + TOPK + k) = 0.125; }
@@ -1580,12 +1919,17 @@ impl Engine {
 
     /// dense GEMM tiling benchmark: QKV-sized Q4_K matrices of all layers, T tokens of random activations
     pub fn kbench_gemm(&self, name: &str, bm: usize, bn: usize, t: usize) -> f64 {
-        self.ensure_batch(self.chunk);
-        let b = self.ba.get();
-        let a = self.act.borrow().contents().as_ptr() as *mut f32;
+        bounds::validate_kbench_t(t, self.chunk).unwrap_or_else(|e| panic!("{e}"));
         let half_x = name.ends_with("_3") || name.starts_with("kgb") || name.starts_with("kgs");
         let nsg: usize = if name.starts_with("kgb") || name.starts_with("kgs") { name.rsplit('_').next().unwrap().parse().unwrap() } else { 4 };
         let swap = name.starts_with("kgs");
+        let max_rows = self.layers.iter().map(|l| l.wq.rows as usize).max().unwrap_or(NH * HD);
+        let (out_off, _, total_floats) = bounds::kbench_scratch_layout(t, E, max_rows, half_x, 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let scratch = self.gpu.buffer(total_floats * std::mem::size_of::<f32>());
+        let a = scratch.contents().as_ptr() as *mut f32;
+        // SAFETY: `scratch` holds `total_floats` f32s (>= `out_off` f32s for input); `kbench_scratch_layout`
+        // guarantees `t * E` elements (f16 when `half_x`, f32 otherwise) fit within `[0, out_off)` floats.
         unsafe {
             for i in 0..t * E {
                 let v = ((i * 7919) % 1000) as f32 / 500.0 - 1.0;
@@ -1593,8 +1937,8 @@ impl Engine {
                     // f32 -> f16 bits (simple round-to-nearest for normal range)
                     let bits = v.to_bits(); let sign = (bits >> 16) & 0x8000; let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
                     let h: u16 = if v == 0.0 || exp <= 0 { sign as u16 } else { (sign | ((exp as u32) << 10) | ((bits >> 13) & 0x3ff)) as u16 };
-                    *(a.add(b.inp[0] as usize) as *mut u16).add(i) = h;
-                } else { *a.add(b.inp[0] as usize + i) = v; }
+                    *(a as *mut u16).add(i) = h;
+                } else { *a.add(i) = v; }
             }
         }
         let mut best = 0.0f64;
@@ -1602,12 +1946,13 @@ impl Engine {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
             self.bind(&e);
+            e.buf(&scratch, 0, 2);
             let tt = t as u32;
             let mut flops = 0.0;
             for l in &self.layers {
                 let w = &l.wq;
                 let sg = GSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
-                                in_off: b.inp[0], out_off: b.gain_o[0], ldo: w.rows, ..Default::default() };
+                                in_off: 0, out_off, ldo: w.rows, ..Default::default() };
                 e.pso(&self.gpu.pso(name)); e.bytes(&sg, 5); e.bytes(&tt, 9);
                 {
                 if swap { e.dispatch((t.div_ceil(bn), (w.rows as usize).div_ceil(bm), 1), 32 * nsg); }
@@ -1659,19 +2004,25 @@ impl Engine {
     /// per-simdgroup tile benchmark: `nact` of `nsg` simdgroups per tile do the matmul. Returns TFLOPs over the ACTIVE tokens.
     /// tensor-unit ceiling probe (fp16 x fp16 from device memory, no weight staging): TFLOPs
     pub fn kbench_peak(&self, name: &str, nsg: usize, t: usize) -> f64 {
-        self.ensure_batch(self.chunk);
-        let b = self.ba.get();
-        let h = self.act.borrow().contents().as_ptr() as *mut u16;
-        unsafe { for i in 0..t * E { *h.add(b.inp[0] as usize * 2 + i) = 0x3800 + ((i * 7919) % 512) as u16; } }
-        let rows = 3072usize;
+        bounds::validate_kbench_t(t, self.chunk).unwrap_or_else(|e| panic!("{e}"));
+        assert!(nsg > 0 && t > 64 && t >= 16 * nsg, "kbench_peak requires nsg > 0, t > 64, t >= 16*nsg (got nsg={nsg}, t={t})");
+        let rows = NH * HD;
+        let (out_off, _, total_floats) = bounds::kbench_scratch_layout(t, E, rows, true, 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let scratch = self.gpu.buffer(total_floats * std::mem::size_of::<f32>());
+        let h = scratch.contents().as_ptr() as *mut u16;
+        // SAFETY: `scratch` holds `total_floats` f32s; `kbench_scratch_layout` guarantees
+        // `t * E` f16 values fit within the input prefix `[0, out_off)` floats.
+        unsafe { for i in 0..t * E { *h.add(i) = 0x3800 + ((i * 7919) % 512) as u16; } }
         let mut best = 0.0f64;
         for _ in 0..3 {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
             self.bind(&e);
+            e.buf(&scratch, 0, 2);
             let tt = t as u32;
             for _ in 0..8 {
-                let sg = GSeg { k: E as u32, in_off: b.inp[0], out_off: b.gain_o[0], ldo: rows as u32, nrows: rows as u32, ..Default::default() };
+                let sg = GSeg { k: E as u32, in_off: 0, out_off, ldo: rows as u32, nrows: rows as u32, ..Default::default() };
                 e.pso(&self.gpu.pso(name)); e.bytes(&sg, 5); e.bytes(&tt, 9);
                 e.dispatch((t / (16 * nsg), rows / 64, 1), 32 * nsg);
                 e.barrier();
@@ -1683,27 +2034,34 @@ impl Engine {
     }
     /// precision-mode probe: TFLOPs of a tile-op variant and its error against the exact-accumulation variant (layer 0 wq, realistic x)
     pub fn kbench_mode(&self, name: &str, t: usize) -> (f64, f64, f64) {
-        self.ensure_batch(self.chunk);
-        let b = self.ba.get();
-        let a = self.act.borrow().contents().as_ptr() as *mut f32;
-        let h = self.act.borrow().contents().as_ptr() as *mut u16;
+        bounds::validate_kbench_t(t, self.chunk).unwrap_or_else(|e| panic!("{e}"));
+        assert!(t >= 128, "kbench_mode requires t >= 128 (got t={t})");
+        let w = &self.layers[0].wq;
+        let (out0, out_stride, total_floats) = bounds::kbench_scratch_layout(t, E, w.rows as usize, true, 2)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let out1 = out0 + out_stride as u32;
+        let scratch = self.gpu.buffer(total_floats * std::mem::size_of::<f32>());
+        let a = scratch.contents().as_ptr() as *const f32;
+        let h = scratch.contents().as_ptr() as *mut u16;
         // x ~ unit-variance pseudo-normal values, as fp16
         let f16 = |v: f32| -> u16 { let bits = v.to_bits(); let sign = (bits >> 16) & 0x8000; let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
             if v == 0.0 || exp <= 0 { sign as u16 } else { (sign | ((exp as u32) << 10) | ((bits >> 13) & 0x3ff)) as u16 } };
         let mut st = 0x9E3779B97F4A7C15u64;
         let mut rnd = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; (st >> 40) as f32 / (1u64 << 24) as f32 };
-        unsafe { for i in 0..t * E { let v = rnd() + rnd() + rnd() + rnd() - 2.0; *h.add(b.inp[0] as usize * 2 + i) = f16(v * 1.7); } }
-        let w = &self.layers[0].wq;
+        // SAFETY: `scratch` holds `total_floats` f32s; `kbench_scratch_layout` guarantees
+        // `t * E` f16 inputs fit in `[0, out0)` floats.
+        unsafe { for i in 0..t * E { let v = rnd() + rnd() + rnd() + rnd() - 2.0; *h.add(i) = f16(v * 1.7); } }
         let run = |nm: &str, out: u32| -> f64 {
             let mut best = 0.0f64;
             for _ in 0..3 {
                 let cb = self.gpu.cmd();
                 let e = Enc::new(&cb);
                 self.bind(&e);
+                e.buf(&scratch, 0, 2);
                 let tt = t as u32;
                 for _ in 0..8 {
                     let sg = GSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
-                                    in_off: b.inp[0], out_off: out, ldo: w.rows, ..Default::default() };
+                                    in_off: 0, out_off: out, ldo: w.rows, ..Default::default() };
                     e.pso(&self.gpu.pso(nm)); e.bytes(&sg, 5); e.bytes(&tt, 9);
                     e.dispatch((t / 128, w.rows as usize / 64, 1), 256);
                     e.barrier();
@@ -1713,29 +2071,39 @@ impl Engine {
             }
             best
         };
-        run("kgmode_0_0", b.q);
-        let tf = run(name, b.gate);
+        run("kgmode_0_0", out0);
+        let tf = run(name, out1);
         let n = t * w.rows as usize;
         let (mut se, mut sr, mut mx) = (0.0f64, 0.0f64, 0.0f64);
-        unsafe { for i in 0..n { let (x, y) = (*a.add(b.gate as usize + i) as f64, *a.add(b.q as usize + i) as f64); se += (x - y) * (x - y); sr += y * y; mx = mx.max((x - y).abs()); } }
+        // SAFETY: GPU work has completed (`waitUntilCompleted` above) and `kbench_scratch_layout`
+        // sized `scratch` for `n` f32s at both `out0` and `out1`.
+        unsafe { for i in 0..n { let (x, y) = (*a.add(out1 as usize + i) as f64, *a.add(out0 as usize + i) as f64); se += (x - y) * (x - y); sr += y * y; mx = mx.max((x - y).abs()); } }
         (tf, (se / sr).sqrt(), mx / (sr / n as f64).sqrt())
     }
     pub fn kbench_sgn(&self, name: &str, nsg: usize, nact: usize, t: usize) -> f64 {
-        self.ensure_batch(self.chunk);
-        let b = self.ba.get();
-        let a = self.act.borrow().contents().as_ptr() as *mut u16;
-        unsafe { for i in 0..t * E { *a.add(b.inp[0] as usize * 2 + i) = 0x3800 + ((i * 7919) % 512) as u16; } }
+        bounds::validate_kbench_t(t, self.chunk).unwrap_or_else(|e| panic!("{e}"));
+        assert!(nsg > 0 && nact <= nsg && t >= 16 * nsg && t <= 0xFFFF,
+                "kbench_sgn invalid params (nsg={nsg}, nact={nact}, t={t})");
+        let max_rows = self.layers.iter().map(|l| l.wq.rows as usize).max().unwrap_or(NH * HD);
+        let (out_off, _, total_floats) = bounds::kbench_scratch_layout(t, E, max_rows, true, 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let scratch = self.gpu.buffer(total_floats * std::mem::size_of::<f32>());
+        let a = scratch.contents().as_ptr() as *mut u16;
+        // SAFETY: `scratch` holds `total_floats` f32s; `kbench_scratch_layout` guarantees
+        // `t * E` f16 inputs fit within `[0, out_off)` floats.
+        unsafe { for i in 0..t * E { *a.add(i) = 0x3800 + ((i * 7919) % 512) as u16; } }
         let mut best = 0.0f64;
         for _ in 0..3 {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
             self.bind(&e);
+            e.buf(&scratch, 0, 2);
             let tt = (t | nact << 16) as u32;
             let mut flops = 0.0;
             for l in &self.layers {
                 let w = &l.wq;
                 let sg = GSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
-                                in_off: b.inp[0], out_off: b.gain_o[0], ldo: w.rows, ..Default::default() };
+                                in_off: 0, out_off, ldo: w.rows, ..Default::default() };
                 e.pso(&self.gpu.pso(name)); e.bytes(&sg, 5); e.bytes(&tt, 9);
                 e.dispatch((t / (16 * nsg), w.rows as usize / 64, 1), 32 * nsg);
                 e.barrier();
@@ -1944,7 +2312,7 @@ impl Engine {
         } else if let (false, Some(pr)) = (l.swa, self.prune.borrow().as_ref()) {
             // dev: far keys from the selection, recent keys from the cache
             let fi = self.slot_kind[slot].1;
-            let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
+            let spl = |nk: usize| { let kps = Self::split_kps(nk); (kps, nk.div_ceil(kps)) };
             let nb = if pr.use_sum { pr.rows } else { pr.rows - 1 };
             let ((k1, n1), (k2, n2)) = (if nb > 0 { spl(nb) } else { (32, 0) }, spl(pos + 1 - pr.r0));
             if nb > 0 {
