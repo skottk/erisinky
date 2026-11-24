@@ -161,7 +161,7 @@ pub struct CtrlJob {
     pub forget_off: u32, pub res_out: u32, pub ss_off: u32, pub norm_w: i32, pub ctr: u32,
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
-pub struct CtrlArgs { pub n_c: u32, pub tstride: u32, pub pad: [u32; 2], pub job: [CtrlJob; 4] }
+pub struct CtrlArgs { pub n_c: u32, pub tstride: u32, pub eps: f32, pub pad: u32, pub job: [CtrlJob; 4] }
 
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct AttnArgs {
@@ -214,7 +214,7 @@ struct CtrlGfJob { gain_w: u32, forget_w: u32, gh_off: u32, u_off: u32, m_off: u
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct CtrlGfArgs { t: u32, njobs: u32, pad: [u32; 2], job: [CtrlGfJob; 4] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
-pub struct CtrlBArgs { pub n: u32, pub pad: [u32; 3], pub job: [CtrlBJob; 4] }
+pub struct CtrlBArgs { pub n: u32, pub eps: f32, pub pad: [u32; 2], pub job: [CtrlBJob; 4] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct GemmArgs { nseg: u32, t: u32, pad: [u32; 2], seg: [GSeg; 10] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
@@ -566,6 +566,94 @@ impl Drop for Engine {
 
 pub fn slot_of(pass: usize, ip: usize) -> usize {
     if pass == 0 || !(LOOP_START..LOOP_END).contains(&ip) { ip } else { N_PHYS + (pass - 1) * (LOOP_END - LOOP_START) + (ip - LOOP_START) }
+}
+
+/// Pure helpers for benchmark aggregation and dev-tool math (Low-Sev #2 & #4).
+pub mod dev_helpers {
+    use std::ops::Range;
+
+    /// Select the fastest (maximum) finite bandwidth sample in GB/s.
+    pub fn best_bandwidth_gbps(samples: impl IntoIterator<Item = f64>) -> f64 {
+        samples
+            .into_iter()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .fold(0.0f64, f64::max)
+    }
+
+    /// Parse `INK_HEADROOM=a,b` safely, falling back to `(16, 0)` on missing or malformed input.
+    pub fn parse_headroom(val: Option<&str>) -> (usize, usize) {
+        val.and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))
+        })
+        .unwrap_or((16, 0))
+    }
+
+    /// Compute rounded KV-cache reserve capacity without dividing by zero when `hd == 0`.
+    pub fn reserve_capacity(need: usize, limit: usize, headroom: bool, hd: usize, hm: usize) -> usize {
+        let want = if headroom {
+            let frac = if hd == 0 { 0 } else { need / hd };
+            need.saturating_add(frac.max(hm))
+        } else {
+            need
+        };
+        want.div_ceil(64).saturating_mul(64).min(limit)
+    }
+
+    /// Saturating query token range `[n - nq, n)` for `kv_screen`.
+    pub fn kv_screen_range(n: usize, nq: usize) -> Range<usize> {
+        n.saturating_sub(nq)..n
+    }
+
+    /// In-place simulated KV-row quantization for `kv_quant_sim`.
+    /// - `bits == 0`: no-op.
+    /// - `bits >= 100`: floating format (`100 + m` mantissa bits; `200 + m` with 3-bit exponent).
+    /// - `bits == 1`: 1-bit sign quantization (`±max_abs`) without dividing by zero.
+    /// - `2..100`: symmetric linear quantization clamped to `<= 24` bits so shifts never overflow.
+    pub fn quantize_row_sim(v: &mut [f32], bits: u32) {
+        if bits == 0 {
+            return;
+        }
+        if bits >= 100 {
+            let (m, lim) = ((bits % 100).min(23) as i32, bits >= 200);
+            for x in v.iter_mut() {
+                if *x == 0.0 || !x.is_finite() {
+                    continue;
+                }
+                let mut e = x.abs().log2().floor() as i32;
+                if lim {
+                    e = e.clamp(-2, 4);
+                }
+                let q = 2f32.powi(e - m);
+                if q == 0.0 || !q.is_finite() {
+                    continue;
+                }
+                let mut y = (*x / q).round() * q;
+                if lim {
+                    y = y.clamp(-(2f32.powi(5) - q), 2f32.powi(5) - q);
+                }
+                *x = y;
+            }
+            return;
+        }
+        let mx = v.iter().fold(0f32, |a, &x| a.max(x.abs()));
+        if mx == 0.0 || !mx.is_finite() {
+            return;
+        }
+        if bits == 1 {
+            for x in v.iter_mut() {
+                if *x != 0.0 {
+                    *x = if *x > 0.0 { mx } else { -mx };
+                }
+            }
+            return;
+        }
+        let eff_bits = bits.min(24);
+        let lv = ((1u64 << (eff_bits - 1)) - 1) as f32;
+        for x in v.iter_mut() {
+            *x = (*x / mx * lv).round() * mx / lv;
+        }
+    }
 }
 
 /// Pure KV-tier math helpers exposed for CPU unit/property testing without a GPU.
@@ -1055,9 +1143,9 @@ impl Engine {
             let old = capc.get();
             if need <= old { return; }
             // slack for the tokens about to be generated: INK_HEADROOM=a,b -> need/a (at least b positions)
-            let (hd, hm) = std::env::var("INK_HEADROOM").ok().and_then(|v| v.split_once(',').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))).unwrap_or((16, 0));
-            let cap = (if headroom { need + (need / hd).max(hm) } else { need }).div_ceil(64) * 64;
-            let cap = cap.min(limit);
+            let headroom_env = std::env::var("INK_HEADROOM").ok();
+            let (hd, hm) = dev_helpers::parse_headroom(headroom_env.as_deref());
+            let cap = dev_helpers::reserve_capacity(need, limit, headroom, hd, hm);
             let eb = self.kvb;
             let nb = self.gpu.buffer(nslots * 2 * NKV * cap * HD * eb);
             // every (slot, K|V, group) row block moves to its place in the larger layout
@@ -1584,7 +1672,7 @@ impl Engine {
         for g in 0..NKV {
             // keys of this group as f32
             let keys: Vec<f32> = (0..n * HD).map(|i| h2f(unsafe { *kp.add(kb as usize + g * cap as usize * HD + i) })).collect();
-            for t in n - nq..n { for hh in 0..3 {
+            for t in dev_helpers::kv_screen_range(n, nq) { for hh in 0..3 {
                 let h = g * 3 + hh;
                 let q: Vec<f32> = (0..HD).map(|d| h2f(unsafe { *qp.add((t * NH + h) * HD + d) })).collect();
                 let sc: Vec<f32> = (0..=t).map(|j| { let k = &keys[j * HD..(j + 1) * HD]; q.iter().zip(k).map(|(a, c)| a * c).sum::<f32>() }).collect();
@@ -1621,24 +1709,9 @@ impl Engine {
                     let idx = if is_swa { pos % cap as usize } else { pos };
                     // SAFETY: `b` + `(g * cap + idx) * HD + HD` lies within the slot's allocated fp16 KV buffer.
                     let row = unsafe { std::slice::from_raw_parts_mut(base.add(b as usize + (g * cap as usize + idx) * HD), HD) };
-                    let v: Vec<f32> = row.iter().map(|&h| h2f(h)).collect();
-                    if bits >= 100 {
-                        let (m, lim) = ((bits % 100) as i32, bits >= 200);
-                        for (r, &x) in row.iter_mut().zip(&v) {
-                            if x == 0.0 { continue; }
-                            let mut e = x.abs().log2().floor() as i32;
-                            if lim { e = e.clamp(-2, 4); }
-                            let q = 2f32.powi(e - m);
-                            let mut y = (x / q).round() * q;
-                            if lim { y = y.clamp(-(2f32.powi(5) - q), 2f32.powi(5) - q); }
-                            *r = f2h(y);
-                        }
-                        continue;
-                    }
-                    let lv = ((1u32 << (bits - 1)) - 1) as f32;
-                    let mx = v.iter().fold(0f32, |a, x| a.max(x.abs()));
-                    if mx == 0.0 { continue; }
-                    for (r, x) in row.iter_mut().zip(&v) { *r = f2h((x / mx * lv).round() * mx / lv); }
+                    let mut v: Vec<f32> = row.iter().map(|&h| h2f(h)).collect();
+                    dev_helpers::quantize_row_sim(&mut v, bits);
+                    for (r, &x) in row.iter_mut().zip(&v) { *r = f2h(x); }
                 } }
             }
         }
@@ -1766,7 +1839,7 @@ impl Engine {
         #[repr(C)] #[derive(Clone, Copy)]
         struct BenchArgs { w_lo: u32, w_hi: u32, row_bytes: u32, nrows: u32, k: u32, x_off: u32, out_off: u32, pad: u32 }
         let rows = 8 * E; // 8 experts' worth of gate_up rows
-        let mut best = f64::MAX;
+        let mut samples = Vec::with_capacity(3);
         for rep in 0..4 {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
@@ -1789,9 +1862,9 @@ impl Engine {
             cb.commit();
             cb.waitUntilCompleted();
             let t = cb.GPUEndTime() - cb.GPUStartTime();
-            if rep > 0 { best = best.min(bytes as f64 / t / 1e9); }
+            if rep > 0 && t > 0.0 { samples.push(bytes as f64 / t / 1e9); }
         }
-        best
+        dev_helpers::best_bandwidth_gbps(samples)
     }
 
     /// micro-benchmark a MoE-down variant over all layers' down experts (random-ish expert picks)
@@ -1804,7 +1877,7 @@ impl Engine {
             for i in 0..TOPK * FF { *a.add(ar.act as usize + i) = ((i * 7919) % 1000) as f32 / 1000.0 - 0.5; }
             for k in 0..TOPK { *a.add(ar.sel as usize + TOPK + k) = 0.125; }
         }
-        let mut best = f64::MAX;
+        let mut samples = Vec::with_capacity(3);
         for rep in 0..4 {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
@@ -1836,9 +1909,9 @@ impl Engine {
             cb.commit();
             cb.waitUntilCompleted();
             let t = cb.GPUEndTime() - cb.GPUStartTime();
-            if rep > 0 { best = best.min(bytes as f64 / t / 1e9); }
+            if rep > 0 && t > 0.0 { samples.push(bytes as f64 / t / 1e9); }
         }
-        best
+        dev_helpers::best_bandwidth_gbps(samples)
     }
 
     /// touch every page of the mapped model from the GPU once (wires the GPU page mappings: avoids first-use
@@ -2176,7 +2249,7 @@ impl Engine {
             Self::seg_pb(j.d_off, 64, (2 * E) as u32, ar.cat[c], j.out_off)
         }).collect();
         self.mv(e, C_CTRLD, &segs);
-        let mut a = CtrlArgs { n_c: jobs.len() as u32, ..Default::default() };
+        let mut a = CtrlArgs { n_c: jobs.len() as u32, eps: self.eps, ..Default::default() };
         for (i, j) in jobs.iter().enumerate() { a.job[i] = *j; }
         self.go(e, C_CTRLA, "k_ctrl_apply", &a, (E / 32, jobs.len(), 1), 256);
     }
@@ -2425,7 +2498,7 @@ impl Engine {
             }
             self.gemm(e, C_CTRLA, &gf, t);
         }
-        let mut a = CtrlBArgs { n: jobs.len() as u32, ..Default::default() };
+        let mut a = CtrlBArgs { n: jobs.len() as u32, eps: self.eps, ..Default::default() };
         for (i, &(c, u, m, out, nw)) in jobs.iter().enumerate() {
             let (h, nof) = hout.get(i).map(|&(h, n)| (h as i32, n as u32)).unwrap_or((-1, 0));
             a.job[i] = if self.hgemm { CtrlBJob { u_off: b.gain_o[c], m_off: u32::MAX, g_off: 0, f_off: 0, out_off: out, norm_w: nw, h_off: h, nof32: nof } }
