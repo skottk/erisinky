@@ -64,9 +64,89 @@ pub struct Cx { e: Enc, cb: Option<CmdBuf> }
 pub static KV8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// initial capacity (positions) of the K/V buffers; they grow with the context
 const KV_CAP0: usize = 64;
+/// Detected `cooperative_tensor` accumulator layout for the fp16 prefill register epilogues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccumLayout {
+    /// Apple10 / M5 neural accelerators: 4-element quads, `r+32` at `+16`.
+    Quad,
+    /// Apple7–9 / M1–M4 `simdgroup_matrix` lowering: 2-element pairs, `r+32` at `+8`.
+    Pair,
+    /// Unrecognized layout: falls back to `hgemm = false`.
+    Unsupported,
+}
+
+/// Pure classifier for `k_layout_sg` probe output (`32 * 64` `i32`s).
+pub fn classify_sg_layout(o: &[i32]) -> AccumLayout {
+    if o.len() < 32 * 64 { return AccumLayout::Unsupported; }
+    let quad_ok = (0..32).all(|t| {
+        if o[t * 64 + 63] != 32 { return false; }
+        let rt = |i: usize| (o[t * 64 + i] >> 16, o[t * 64 + i] & 0xffff);
+        for q in 0..8 {
+            let v0 = o[t * 64 + 4 * q];
+            let (r0, t0) = rt(4 * q);
+            if v0 < 0 || r0 % 4 != 0 || r0 >= 64 || t0 >= 16 { return false; }
+            for e in 1..4 { if rt(4 * q + e) != (r0 + e as i32, t0) { return false; } }
+            if q < 4 && (r0 >= 32 || rt(4 * q + 16) != (r0 + 32, t0)) { return false; }
+        }
+        true
+    });
+    if quad_ok { return AccumLayout::Quad; }
+    let pair_ok = (0..32).all(|t| {
+        if o[t * 64 + 63] != 32 { return false; }
+        let rt = |i: usize| (o[t * 64 + i] >> 16, o[t * 64 + i] & 0xffff);
+        for h in 0..2 {
+            for p in 0..8 {
+                let idx = h * 16 + 2 * p;
+                let v0 = o[t * 64 + idx];
+                let (r0, t0) = rt(idx);
+                if v0 < 0 || r0 % 2 != 0 || r0 >= 64 || t0 >= 16 { return false; }
+                if rt(idx + 1) != (r0 + 1, t0) { return false; }
+                if p < 4 && (r0 >= 32 || rt(idx + 8) != (r0 + 32, t0) || rt(idx + 9) != (r0 + 33, t0)) {
+                    return false;
+                }
+            }
+        }
+        true
+    });
+    if pair_ok { AccumLayout::Pair } else { AccumLayout::Unsupported }
+}
+
+/// Pure classifier for `k_layout_att` probe output (`256 * 64` `i32`s).
+pub fn classify_att_layout(o: &[i32]) -> AccumLayout {
+    if o.len() < 256 * 64 { return AccumLayout::Unsupported; }
+    let quad_ok = (0..256).all(|t| {
+        if o[t * 64 + 63] != 16 { return false; }
+        for q in 0..4 {
+            let v0 = o[t * 64 + 4 * q];
+            let (d0, r0) = (v0 >> 16, v0 & 0xffff);
+            if v0 < 0 || d0 % 4 != 0 || d0 >= HD as i32 || r0 >= 32 { return false; }
+            for e in 1..4 { if o[t * 64 + 4 * q + e] != ((d0 + e as i32) << 16 | r0) { return false; } }
+        }
+        true
+    });
+    if quad_ok { return AccumLayout::Quad; }
+    let pair_ok = (0..256).all(|t| {
+        if o[t * 64 + 63] != 16 { return false; }
+        for h in 0..2 {
+            let row_ref = o[t * 64 + h * 8] & 0xffff;
+            if row_ref >= 32 { return false; }
+            for p in 0..4 {
+                let idx = h * 8 + 2 * p;
+                let v0 = o[t * 64 + idx];
+                let (d0, r0) = (v0 >> 16, v0 & 0xffff);
+                if v0 < 0 || d0 % 2 != 0 || d0 >= HD as i32 || r0 != row_ref { return false; }
+                if o[t * 64 + idx + 1] != ((d0 + 1) << 16 | row_ref) { return false; }
+            }
+        }
+        true
+    });
+    if pair_ok { AccumLayout::Pair } else { AccumLayout::Unsupported }
+}
+
 /// MoE tile classes of the fp16 prefill path: (kernel, max tokens per tile, threads per threadgroup)
 pub const NTC: usize = 2;
 const MOE_CLS: [(&str, usize, usize); NTC] = [("k_moe_sg8", 128, 256), ("k_moe_sg4", 64, 128)];
+const MOE_CLS_P: [(&str, usize, usize); NTC] = [("k_moe_sg8_p", 128, 256), ("k_moe_sg4_p", 64, 128)];
 pub const MAX_SPLIT: usize = 256;
 
 /// kernel classes, for skip-mask profiling
@@ -83,7 +163,7 @@ pub const KERNELS: &[&str] = &[
     "k_embed", "k_mix", "k_mv", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2",
     "k_topk", "k_norm",
-    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
+    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_gemm_sg8_p", "k_gemm_sg4_p", "k_moe_sg8", "k_moe_sg4", "k_moe_sg8_p", "k_moe_sg4_p", "k_ctrl_gf", "k_ctrl_gf_p", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_p", "k_kvcopy", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
 ];
 
@@ -544,7 +624,7 @@ pub struct Engine {
     loops: Vec<LoopW>,
     tok_embd: QW, tok_norm: u32, output: QW, output_norm: u32, output_res_query: u32,
     pub ar: Arena,
-    pub kv8: bool, kvb: usize, ba: std::cell::Cell<BArena>, pub chunk: usize, pub tensor: bool, pub hgemm: bool, sep_comb: bool, sep_topk: bool,
+    pub kv8: bool, kvb: usize, ba: std::cell::Cell<BArena>, pub chunk: usize, pub tensor: bool, pub hgemm: bool, pub accum_layout: AccumLayout, sep_comb: bool, sep_topk: bool,
     /// last-layer tail mode of the prefill (dev tools switch it off to profile full layers)
     pub tail: std::cell::Cell<bool>,
     pub skip: std::cell::Cell<u32>,
@@ -1167,6 +1247,7 @@ impl Engine {
             swa_cap: std::cell::Cell::new(cap0), full_cap: std::cell::Cell::new(cap0), slot_kind, tier, qcap: RefCell::new(None), prune: RefCell::new(None), cs, toks, ctr, layers, loops, tok_embd, tok_norm, output, output_norm, output_res_query,
             ar, kv8, kvb, ba: Default::default(), chunk, tensor: std::env::var("INK_NO_TENSOR").is_err(),
             hgemm: std::env::var("INK_NO_HGEMM").is_err() && std::env::var("INK_NO_TENSOR").is_err(),
+            accum_layout: AccumLayout::Unsupported,
             sep_comb: std::env::var("INK_FUSE_COMB").is_err(), sep_topk: std::env::var("INK_SEP_TOPK").is_ok(),
             tail: std::cell::Cell::new(std::env::var("INK_NO_TAIL").is_err()),
             skip: Default::default(), stop: std::cell::Cell::new(usize::MAX), done: std::cell::Cell::new(0),
@@ -1175,12 +1256,14 @@ impl Engine {
             gpu, g,
         };
         let mut eng = eng;
-        eng.ensure_batch(64);
-        let ok = !eng.hgemm || eng.layout_ok();
-        eng.release_batch();
-        if !ok {
-            eprintln!("[inkling] unexpected tensor accumulator layout on this GPU/OS: using the slower prefill path");
-            eng.hgemm = false;
+        if eng.hgemm {
+            eng.ensure_batch(64);
+            eng.accum_layout = eng.detect_layout();
+            eng.release_batch();
+            if eng.accum_layout == AccumLayout::Unsupported {
+                eprintln!("[inkling] unexpected tensor accumulator layout on this GPU/OS: using the slower prefill path");
+                eng.hgemm = false;
+            }
         }
         if std::env::var("INK_NO_WARM").is_err() { eng.warm(); }
         Ok(eng)
@@ -1848,10 +1931,10 @@ impl Engine {
         };
         [cls(0), cls(1)]
     }
-    /// The register epilogues of the fp16 kernels assume how the tensor ops spread their accumulators over threads
-    /// (see the comment above k_gemm_sg in prefill.metal).
-    fn layout_ok(&self) -> bool {
-        {
+    /// Detect how `mpp::tensor_ops::matmul2d` lays out register accumulators on this GPU/OS
+    /// (see the comments above `k_attn_h` and `k_gemm_sg` in `prefill.metal`).
+    fn detect_layout(&self) -> AccumLayout {
+        let sg_lay = {
             let out_off = self.ba.get().yd;
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
@@ -1860,19 +1943,10 @@ impl Engine {
             e.dispatch((1, 1, 1), 32);
             e.end(); cb.commit(); cb.waitUntilCompleted();
             let o = unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const i32).add(out_off as usize), 32 * 64) };
-            for t in 0..32 {
-                if o[t * 64 + 63] != 32 { return false; }
-                let rt = |i: usize| (o[t * 64 + i] >> 16, o[t * 64 + i] & 0xffff);
-                for q in 0..8 {
-                    let (r0, t0) = rt(4 * q);
-                    if o[t * 64 + 4 * q] < 0 || r0 % 4 != 0 || t0 >= 16 { return false; }
-                    for e in 1..4 { if rt(4 * q + e) != (r0 + e as i32, t0) { return false; } }
-                    if q < 4 && (r0 >= 32 || rt(4 * q + 16) != (r0 + 32, t0)) { return false; }
-                }
-            }
-        }
-        // attention P.V accumulators: 16 per thread, quads of 4 consecutive dims of one query row
-        {
+            classify_sg_layout(o)
+        };
+        if sg_lay == AccumLayout::Unsupported { return AccumLayout::Unsupported; }
+        let att_lay = {
             let out_off = self.ba.get().yd;
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
@@ -1881,16 +1955,13 @@ impl Engine {
             e.dispatch((1, 1, 1), 256);
             e.end(); cb.commit(); cb.waitUntilCompleted();
             let o = unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const i32).add(out_off as usize), 256 * 64) };
-            for t in 0..256 {
-                if o[t * 64 + 63] != 16 { return false; }
-                for q in 0..4 {
-                    let (d0, r0) = (o[t * 64 + 4 * q] >> 16, o[t * 64 + 4 * q] & 0xffff);
-                    if o[t * 64 + 4 * q] < 0 || d0 % 4 != 0 { return false; }
-                    for e in 1..4 { if o[t * 64 + 4 * q + e] != ((d0 + e as i32) << 16 | r0) { return false; } }
-                }
-            }
-        }
-        true
+            classify_att_layout(o)
+        };
+        if sg_lay == att_lay { sg_lay } else { AccumLayout::Unsupported }
+    }
+    #[inline] fn is_pair(&self) -> bool { self.accum_layout == AccumLayout::Pair }
+    #[inline] fn moe_cls(&self) -> &'static [(&'static str, usize, usize); NTC] {
+        if self.is_pair() { &MOE_CLS_P } else { &MOE_CLS }
     }
     pub fn token_at(&self, i: usize) -> u32 {
         bounds::validate_token_at(i, self.max_ctx).unwrap_or_else(|e| panic!("{e}"));
@@ -2144,7 +2215,7 @@ impl Engine {
                 let e = Enc::new(&cb);
                 self.bind(&e);
                 for l in &self.layers {
-                    for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
+                    for (c, (name, _, tg)) in self.moe_cls().iter().enumerate() {
                         let g = if which == 0 { MoeGemmHArgs {
                             w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
                             wtype: l.gu.ty, nrows: (2 * FF) as u32, k: E as u32, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
@@ -2580,7 +2651,7 @@ impl Engine {
             for (i, &(c, u, m, _, _)) in jobs.iter().enumerate() {
                 ga.job[i] = CtrlGfJob { gain_w: lw.gain[c], forget_w: lw.forget[c], gh_off: b.gh[c], u_off: u, m_off: m, raw_off: b.gain_o[c], pad: [0; 2] };
             }
-            self.go(e, C_CTRLA, "k_ctrl_gf", &ga, (t.div_ceil(128), jobs.len() * (E / 32), 1), 256);
+            self.go(e, C_CTRLA, if self.is_pair() { "k_ctrl_gf_p" } else { "k_ctrl_gf" }, &ga, (t.div_ceil(128), jobs.len() * (E / 32), 1), 256);
         } else {
             let down: Vec<GSeg> = jobs.iter().map(|&(c, _, _, _, _)| pb(lw.down[c], 64, (2 * E) as u32, b.cat_u[c], b.cat_m[c], b.ctrlg[c])).collect();
             self.gemm(e, C_CTRLD, &down, t);
@@ -2618,8 +2689,8 @@ impl Engine {
         let mut a = GemmHArgs { nseg: segs.len() as u32, t: t as u32, ..Default::default() };
         let mut tiles = 0u32;
         for (i, sg) in segs.iter().enumerate() { a.seg[i] = *sg; a.seg[i].tile_start = tiles; tiles += sg.nrows.div_ceil(64); }
-        if t > 64 { self.go(e, cls, "k_gemm_sg8", &a, (t.div_ceil(128), tiles as usize, 1), 256); }
-        else { self.go(e, cls, "k_gemm_sg4", &a, (1, tiles as usize, 1), 128); }
+        if t > 64 { self.go(e, cls, if self.is_pair() { "k_gemm_sg8_p" } else { "k_gemm_sg8" }, &a, (t.div_ceil(128), tiles as usize, 1), 256); }
+        else { self.go(e, cls, if self.is_pair() { "k_gemm_sg4_p" } else { "k_gemm_sg4" }, &a, (1, tiles as usize, 1), 128); }
     }
     fn hseg(w: &QW, xh: u32, out: u32) -> HSeg {
         HSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k, xh_off: xh, out_off: out, ldo: w.rows, ..Default::default() }
@@ -2795,7 +2866,7 @@ impl Engine {
         if hatt {
             let ah = AttnBArgs { t: nn_, p0: (p0 + ts) as u32, qp_off: sh(b.qp, NH * HD / 2), rp_off: sh(b.rp, NH * NREL), sink_off: sh(b.sink, NH),
                                  gate_off: sh(b.gate, if qgh { NH * HD / 2 } else { NH * HD }), out_off: sh(b.agh, NH * HD / 2), ghalf: qgh as u32, ..aa };
-            self.go(e, C_ATTN, "k_attn_h", &ah, (n.div_ceil(32), NH, 1), 256);
+            self.go(e, C_ATTN, if self.is_pair() { "k_attn_h_p" } else { "k_attn_h" }, &ah, (n.div_ceil(32), NH, 1), 256);
         }
         else if self.tensor { self.go(e, C_ATTN, "k_attn_bt", &aa, (t.div_ceil(32), NH, 1), 256); }
         else { self.go(e, C_ATTN, "k_attn_b", &aa, (t.div_ceil(8), NKV, 1), 128); }
@@ -2861,7 +2932,7 @@ impl Engine {
             e.barrier();
             // tiles in four widths, sized on the GPU by the routing kernel (indirect dispatch); classes run concurrently
             if self.skip.get() & (1 << C_GU) == 0 {
-                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
+                for (c, (name, _, tg)) in self.moe_cls().iter().enumerate() {
                     let g = MoeGemmHArgs {
                         w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
                         wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
@@ -2873,7 +2944,7 @@ impl Engine {
                 e.barrier();
             }
             if self.skip.get() & (1 << C_DOWN) == 0 {
-                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
+                for (c, (name, _, tg)) in self.moe_cls().iter().enumerate() {
                     let d = MoeGemmHArgs {
                         w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
                         wtype: l.dn.ty, nrows: es, k: FF as u32, xh_off: b.acth, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,

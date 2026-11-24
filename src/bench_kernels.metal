@@ -604,9 +604,11 @@ kernel void kg_mode(device const uchar * W [[buffer(0)]], device float * A [[buf
         threadgroup_barrier(mem_flags::mem_threadgroup);
         buf ^= 1;
     }
-    for (short q = 0; q < 8; ++q) {
-        const auto ix = cT.get_multidimensional_index(4 * q);
-        *(device float4 *) (A + S.out_off + (ulong) (t0 + ix[1]) * S.ldo + r0 + ix[0]) = float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]);
+    for (short i = 0; i < cT.get_capacity(); ++i) {
+        if (cT.is_valid_element(i)) {
+            const auto ix = cT.get_multidimensional_index(i);
+            A[S.out_off + (ulong) (t0 + ix[1]) * S.ldo + r0 + ix[0]] = float(cT[i]);
+        }
     }
 }
 template [[host_name("kgmode_0_0")]] kernel void kg_mode<0, 0>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort, ushort);
