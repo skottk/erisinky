@@ -807,6 +807,7 @@ kernel void k_attn_bt(device const uchar * PB [[buffer(1)]], device float * A [[
 #define AQ 32
 #define AK 64
 #define AG 96
+template <int PAIR>
 kernel void k_attn_h(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], device kv_t * KV [[buffer(3)]],
                      constant AttnBArgs & a [[buffer(5)]],
                      uint2 tgp [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -832,9 +833,16 @@ kernel void k_attn_h(device const uchar * PB [[buffer(1)]], device float * A [[b
     auto tv0 = tensor(vbase, dextents<int32_t, 2>(HD, AK), array<int, 2>({1, HD}));
     auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
     for (short i = 0; i < 16; ++i) co[i] = 0.0f;
-    // this thread's accumulators: 4 quads of (4 consecutive dims, one query row)
-    ushort cd[4], cr[4];
-    for (short q = 0; q < 4; ++q) { const auto ix = co.get_multidimensional_index(4 * q); cd[q] = ix[0]; cr[q] = ix[1]; }
+    // PAIR == 0 (Apple10/M5): 4 quads of (4 consecutive dims, one query row)
+    // PAIR != 0 (Apple7-9/M1-M4): 8 pairs of (2 consecutive dims, one query row); pairs 0..3 share cr[0], pairs 4..7 share cr[1]
+    ushort cd[8], cr[4];
+    if (PAIR) {
+        cr[0] = co.get_multidimensional_index((short) 0)[1];
+        cr[1] = co.get_multidimensional_index((short) 8)[1];
+        for (short p = 0; p < 8; ++p) cd[p] = co.get_multidimensional_index((short) (2 * p))[0];
+    } else {
+        for (short q = 0; q < 4; ++q) { const auto ix = co.get_multidimensional_index((short) (4 * q)); cd[q] = ix[0]; cr[q] = ix[1]; }
+    }
     // this simdgroup's query rows: j = jj * 8 + sg
     float M[4], S[4];
     for (short jj = 0; jj < 4; jj++) {
@@ -898,7 +906,11 @@ kernel void k_attn_h(device const uchar * PB [[buffer(1)]], device float * A [[b
             if (lane == 0) sr[j] = ms;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        {
+        if (PAIR) {
+            const float r0 = sr[cr[0]], r1 = sr[cr[1]];
+            for (short i = 0; i < 8; ++i) co[i] *= r0;
+            for (short i = 8; i < 16; ++i) co[i] *= r1;
+        } else {
             const float r0 = sr[cr[0]], r1 = sr[cr[1]], r2 = sr[cr[2]], r3 = sr[cr[3]];
             co[0] *= r0; co[1] *= r0; co[2] *= r0; co[3] *= r0;
             co[4] *= r1; co[5] *= r1; co[6] *= r1; co[7] *= r1;
@@ -912,16 +924,30 @@ kernel void k_attn_h(device const uchar * PB [[buffer(1)]], device float * A [[b
     for (short jj = 0; jj < 4; jj++) { if (lane == 0) sr[jj * 8 + sg] = 1.0f / S[jj]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device half * out = (device half *) (A + a.out_off);
-    for (short q = 0; q < 4; ++q) {
-        const uint row = cr[q];
-        if (row < nq) {
-            const uint o = (t0 + row) * (NH * HD) + h * HD + cd[q];
-            const float4 gt = a.ghalf ? float4(*(device const half4 *) ((device const half *) (A + a.gate_off) + o)) : *(device const float4 *) (A + a.gate_off + o);
-            const float4 v = float4(co[4 * q], co[4 * q + 1], co[4 * q + 2], co[4 * q + 3]) * sr[row] / (1.0f + exp(-gt));
-            *(device half4 *) (out + o) = half4(v);
+    if (PAIR) {
+        for (short p = 0; p < 8; ++p) {
+            const uint row = cr[p >> 2];
+            if (row < nq) {
+                const uint o = (t0 + row) * (NH * HD) + h * HD + cd[p];
+                const float2 gt = a.ghalf ? float2(*(device const half2 *) ((device const half *) (A + a.gate_off) + o)) : *(device const float2 *) (A + a.gate_off + o);
+                const float2 v = float2(co[2 * p], co[2 * p + 1]) * sr[row] / (1.0f + exp(-gt));
+                *(device half2 *) (out + o) = half2(v);
+            }
+        }
+    } else {
+        for (short q = 0; q < 4; ++q) {
+            const uint row = cr[q];
+            if (row < nq) {
+                const uint o = (t0 + row) * (NH * HD) + h * HD + cd[q];
+                const float4 gt = a.ghalf ? float4(*(device const half4 *) ((device const half *) (A + a.gate_off) + o)) : *(device const float4 *) (A + a.gate_off + o);
+                const float4 v = float4(co[4 * q], co[4 * q + 1], co[4 * q + 2], co[4 * q + 3]) * sr[row] / (1.0f + exp(-gt));
+                *(device half4 *) (out + o) = half4(v);
+            }
         }
     }
 }
+template [[host_name("k_attn_h")]] kernel void k_attn_h<0>(device const uchar *, device float *, device kv_t *, constant AttnBArgs &, uint2, ushort, ushort);
+template [[host_name("k_attn_h_p")]] kernel void k_attn_h<1>(device const uchar *, device float *, device kv_t *, constant AttnBArgs &, uint2, ushort, ushort);
 // accumulator layout probe for k_attn_h's P.V op (same format as k_layout)
 kernel void k_layout_att(device float * A [[buffer(2)]], device kv_t * KV [[buffer(3)]], constant uint & out_off [[buffer(5)]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup half sp[AQ * AK];
@@ -1104,8 +1130,9 @@ inline void wstage(device const uchar * wr, uint wtype, uint k0, uint hp, thread
 // 128 threads, double-buffered), and every simdgroup runs its OWN tensor op (execution_simdgroup) on its own 16 tokens with the
 // accumulators (64 x 16) in registers. Compared with one op over the whole threadgroup this is a little faster, and simdgroups
 // whose tokens do not exist simply skip the matmul, so ragged token counts cost 16-token granularity instead of a whole tile.
-// Register epilogues rely on the op's accumulator layout: 8 quads of 4 consecutive rows per thread, quads q and q+4 holding rows
-// r and r+32 of the same token. Engine::load verifies this with k_layout_sg before enabling the path.
+// Register epilogues rely on the op's accumulator layout (verified at load by Engine::detect_layout with k_layout_sg):
+// - PAIR == 0 (Apple10/M5): 8 quads of 4 consecutive rows per thread, quads q and q+4 (+16) holding rows r and r+32 of the same token.
+// - PAIR != 0 (Apple7-9/M1-M4): 16 pairs of 2 consecutive rows per thread in two 16-element token halves, pairs i and i+8 holding r and r+32.
 #define SGOP(mm) mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(16, HB_M, HB_K, false, true, false, \
     mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroup> mm
 
@@ -1113,7 +1140,7 @@ inline void wstage(device const uchar * wr, uint wtype, uint k0, uint hp, thread
 // Metal sweeps y fastest, so the row tiles of one token tile run together and its X stays cached.
 struct HSeg { uint w_lo, w_hi, row_bytes, wtype, nrows, K, tile_start, xh_off, out_off, ldo, wsrc, hout; };   // hout: half output [T][ldo]
 struct GemmHArgs { uint nseg, T, pad0, pad1; HSeg seg[10]; };
-template <int NSG>
+template <int NSG, int PAIR = 0>
 kernel void k_gemm_sg(device const uchar * W [[buffer(0)]], device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
                       constant GemmHArgs & args [[buffer(5)]], uint2 tgq [[threadgroup_position_in_grid]],
                       ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -1147,18 +1174,28 @@ kernel void k_gemm_sg(device const uchar * W [[buffer(0)]], device const uchar *
     if (!on) return;
     if (S.hout) {
         device half * yo = (device half *) (A + S.out_off);
-        for (short q = 0; q < 8; ++q) {
-            const auto ix = cT.get_multidimensional_index(4 * q);
-            const uint r = r0 + ix[0], t = t0 + ix[1];
-            if (r < S.nrows && t < T) *(device half4 *) (yo + (ulong) t * S.ldo + r) = half4(float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]));
+        if (PAIR) {
+            for (short p = 0; p < 16; ++p) {
+                const auto ix = cT.get_multidimensional_index((short) (2 * p));
+                const uint r = r0 + ix[0], t = t0 + ix[1];
+                if (r < S.nrows && t < T) *(device half2 *) (yo + (ulong) t * S.ldo + r) = half2(float2(cT[2 * p], cT[2 * p + 1]));
+            }
+        } else {
+            for (short q = 0; q < 8; ++q) {
+                const auto ix = cT.get_multidimensional_index((short) (4 * q));
+                const uint r = r0 + ix[0], t = t0 + ix[1];
+                if (r < S.nrows && t < T) *(device half4 *) (yo + (ulong) t * S.ldo + r) = half4(float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]));
+            }
         }
         return;
     }
     auto tC = tensor(A + S.out_off + (ulong) t0 * S.ldo + r0, dextents<int32_t, 2>(min(HB_M, (int) (S.nrows - r0)), nt), array<int, 2>({1, (int) S.ldo}));
     cT.store(tC);
 }
-template [[host_name("k_gemm_sg8")]] kernel void k_gemm_sg<8>(device const uchar *, device const uchar *, device float *, constant GemmHArgs &, uint2, ushort, ushort);
-template [[host_name("k_gemm_sg4")]] kernel void k_gemm_sg<4>(device const uchar *, device const uchar *, device float *, constant GemmHArgs &, uint2, ushort, ushort);
+template [[host_name("k_gemm_sg8")]] kernel void k_gemm_sg<8, 0>(device const uchar *, device const uchar *, device float *, constant GemmHArgs &, uint2, ushort, ushort);
+template [[host_name("k_gemm_sg4")]] kernel void k_gemm_sg<4, 0>(device const uchar *, device const uchar *, device float *, constant GemmHArgs &, uint2, ushort, ushort);
+template [[host_name("k_gemm_sg8_p")]] kernel void k_gemm_sg<8, 1>(device const uchar *, device const uchar *, device float *, constant GemmHArgs &, uint2, ushort, ushort);
+template [[host_name("k_gemm_sg4_p")]] kernel void k_gemm_sg<4, 1>(device const uchar *, device const uchar *, device float *, constant GemmHArgs &, uint2, ushort, ushort);
 
 // grouped MoE GEMM (contiguous half rows per tile: gathered gate_up input / act rows). grid (tiles, column blocks).
 // situ=1: rows = 32 gate + 32 up of column block y; SiTU * routing weight in registers -> half act [A][FF]. situ=0: half out [A][ldo].
@@ -1166,7 +1203,7 @@ struct MoeGemmHArgs {
     uint w_lo, w_hi, expert_bytes, row_bytes, wtype, nrows, K, xh_off;
     uint tiles_off, ntiles_off, out_off, ldo, situ, aw_off; float beta, lbeta;
 };
-template <int NSG>
+template <int NSG, int PAIR = 0>
 kernel void k_moe_sg(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant MoeGemmHArgs & a [[buffer(5)]],
                      uint2 tgq [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup half sa[2][HB_M * HB_K];
@@ -1201,28 +1238,55 @@ kernel void k_moe_sg(device const uchar * W [[buffer(0)]], device float * A [[bu
     if (!on) return;
     if (!a.situ) {
         device half * yd = (device half *) (A + a.out_off);
-        for (short q = 0; q < 8; ++q) {
-            const auto ix = cT.get_multidimensional_index(4 * q);
-            const uint r = ix[0], t = ts0 + ix[1];
-            if (t < cnt) *(device half4 *) (yd + (ulong) (as0 + t) * a.ldo + cb * HB_M + r) = half4(float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]));
+        if (PAIR) {
+            for (short p = 0; p < 16; ++p) {
+                const auto ix = cT.get_multidimensional_index((short) (2 * p));
+                const uint r = ix[0], t = ts0 + ix[1];
+                if (t < cnt) *(device half2 *) (yd + (ulong) (as0 + t) * a.ldo + cb * HB_M + r) = half2(float2(cT[2 * p], cT[2 * p + 1]));
+            }
+        } else {
+            for (short q = 0; q < 8; ++q) {
+                const auto ix = cT.get_multidimensional_index((short) (4 * q));
+                const uint r = ix[0], t = ts0 + ix[1];
+                if (t < cnt) *(device half4 *) (yd + (ulong) (as0 + t) * a.ldo + cb * HB_M + r) = half4(float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]));
+            }
         }
         return;
     }
     device half * act = (device half *) (A + a.out_off);
-    for (short q = 0; q < 4; ++q) {
-        const auto ix = cT.get_multidimensional_index(4 * q);          // gate rows r..r+3; quad q+4 holds the matching up rows
-        const uint r = ix[0], t = ts0 + ix[1];
-        if (t < cnt) {
-            const float4 gt = float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]);
-            const float4 up = float4(cT[4 * q + 16], cT[4 * q + 17], cT[4 * q + 18], cT[4 * q + 19]);
-            const float4 su = a.lbeta > 0 ? a.lbeta * tanh(up / a.lbeta) : up;
-            const float4 o = (A[a.aw_off + as0 + t] * a.beta) * tanh(gt / a.beta) / (1.0f + exp(-gt)) * su;
-            *(device half4 *) (act + (ulong) (as0 + t) * FF + cb * 32 + r) = half4(o);
+    if (PAIR) {
+        for (short h = 0; h < 2; ++h) {
+            for (short p = 0; p < 4; ++p) {
+                const short i = h * 16 + 2 * p;
+                const auto ix = cT.get_multidimensional_index(i);      // gate rows r..r+1; i+8 holds the matching up rows
+                const uint r = ix[0], t = ts0 + ix[1];
+                if (t < cnt) {
+                    const float2 gt = float2(cT[i], cT[i + 1]);
+                    const float2 up = float2(cT[i + 8], cT[i + 9]);
+                    const float2 su = a.lbeta > 0 ? a.lbeta * tanh(up / a.lbeta) : up;
+                    const float2 o = (A[a.aw_off + as0 + t] * a.beta) * tanh(gt / a.beta) / (1.0f + exp(-gt)) * su;
+                    *(device half2 *) (act + (ulong) (as0 + t) * FF + cb * 32 + r) = half2(o);
+                }
+            }
+        }
+    } else {
+        for (short q = 0; q < 4; ++q) {
+            const auto ix = cT.get_multidimensional_index((short) (4 * q));          // gate rows r..r+3; quad q+4 holds the matching up rows
+            const uint r = ix[0], t = ts0 + ix[1];
+            if (t < cnt) {
+                const float4 gt = float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]);
+                const float4 up = float4(cT[4 * q + 16], cT[4 * q + 17], cT[4 * q + 18], cT[4 * q + 19]);
+                const float4 su = a.lbeta > 0 ? a.lbeta * tanh(up / a.lbeta) : up;
+                const float4 o = (A[a.aw_off + as0 + t] * a.beta) * tanh(gt / a.beta) / (1.0f + exp(-gt)) * su;
+                *(device half4 *) (act + (ulong) (as0 + t) * FF + cb * 32 + r) = half4(o);
+            }
         }
     }
 }
-template [[host_name("k_moe_sg8")]] kernel void k_moe_sg<8>(device const uchar *, device float *, constant MoeGemmHArgs &, uint2, ushort, ushort);
-template [[host_name("k_moe_sg4")]] kernel void k_moe_sg<4>(device const uchar *, device float *, constant MoeGemmHArgs &, uint2, ushort, ushort);
+template [[host_name("k_moe_sg8")]] kernel void k_moe_sg<8, 0>(device const uchar *, device float *, constant MoeGemmHArgs &, uint2, ushort, ushort);
+template [[host_name("k_moe_sg4")]] kernel void k_moe_sg<4, 0>(device const uchar *, device float *, constant MoeGemmHArgs &, uint2, ushort, ushort);
+template [[host_name("k_moe_sg8_p")]] kernel void k_moe_sg<8, 1>(device const uchar *, device float *, constant MoeGemmHArgs &, uint2, ushort, ushort);
+template [[host_name("k_moe_sg4_p")]] kernel void k_moe_sg<4, 1>(device const uchar *, device float *, constant MoeGemmHArgs &, uint2, ushort, ushort);
 
 // ---- loop controllers, gain/forget GEMM with the apply fused into the epilogue (fp16 path).
 // TG = (128-token tile, job, 32-channel block): rows = 32 gain + 32 forget rows of the block, K = 64 (the controller state g, half).
@@ -1230,6 +1294,7 @@ template [[host_name("k_moe_sg4")]] kernel void k_moe_sg<4>(device const uchar *
 // written once; the gain / forget pre-activations never touch memory. grid (T/128, njobs * E/32), 256 threads.
 struct CtrlGfJob { uint gain_w, forget_w, gh_off, u_off, m_off, raw_off, pad0, pad1; };
 struct CtrlGfArgs { uint T, njobs, pad0, pad1; CtrlGfJob job[4]; };
+template <int PAIR>
 kernel void k_ctrl_gf(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], constant CtrlGfArgs & a [[buffer(5)]],
                       uint2 tgq [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup half sa[2][HB_M * HB_K];
@@ -1255,18 +1320,37 @@ kernel void k_ctrl_gf(device const uchar * PB [[buffer(1)]], device float * A [[
     if (!on) return;
     { auto sx = tX.slice(0, 0); mm.run(sx, tA0, cT); }
     { auto sx = tX.slice(32, 0); mm.run(sx, tA1, cT); }
-    for (short q = 0; q < 4; ++q) {
-        const auto ix = cT.get_multidimensional_index(4 * q);
-        const uint r = ix[0], t = t0 + ix[1];
-        if (t < a.T) {
-            const uint o = t * E + cb * 32 + r;
-            const float4 gn = float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]);
-            const float4 fg = float4(cT[4 * q + 16], cT[4 * q + 17], cT[4 * q + 18], cT[4 * q + 19]);
-            const float4 u = *(device const float4 *) (A + J.u_off + o), m = *(device const float4 *) (A + J.m_off + o);
-            *(device float4 *) (A + J.raw_off + o) = u - tanh(fg) * u + tanh(gn) * m;
+    if (PAIR) {
+        for (short h = 0; h < 2; ++h) {
+            for (short p = 0; p < 4; ++p) {
+                const short i = h * 16 + 2 * p;
+                const auto ix = cT.get_multidimensional_index(i);
+                const uint r = ix[0], t = t0 + ix[1];
+                if (t < a.T) {
+                    const uint o = t * E + cb * 32 + r;
+                    const float2 gn = float2(cT[i], cT[i + 1]);
+                    const float2 fg = float2(cT[i + 8], cT[i + 9]);
+                    const float2 u = *(device const float2 *) (A + J.u_off + o), m = *(device const float2 *) (A + J.m_off + o);
+                    *(device float2 *) (A + J.raw_off + o) = u - tanh(fg) * u + tanh(gn) * m;
+                }
+            }
+        }
+    } else {
+        for (short q = 0; q < 4; ++q) {
+            const auto ix = cT.get_multidimensional_index((short) (4 * q));
+            const uint r = ix[0], t = t0 + ix[1];
+            if (t < a.T) {
+                const uint o = t * E + cb * 32 + r;
+                const float4 gn = float4(cT[4 * q], cT[4 * q + 1], cT[4 * q + 2], cT[4 * q + 3]);
+                const float4 fg = float4(cT[4 * q + 16], cT[4 * q + 17], cT[4 * q + 18], cT[4 * q + 19]);
+                const float4 u = *(device const float4 *) (A + J.u_off + o), m = *(device const float4 *) (A + J.m_off + o);
+                *(device float4 *) (A + J.raw_off + o) = u - tanh(fg) * u + tanh(gn) * m;
+            }
         }
     }
 }
+template [[host_name("k_ctrl_gf")]] kernel void k_ctrl_gf<0>(device const uchar *, device float *, constant CtrlGfArgs &, uint2, ushort, ushort);
+template [[host_name("k_ctrl_gf_p")]] kernel void k_ctrl_gf<1>(device const uchar *, device float *, constant CtrlGfArgs &, uint2, ushort, ushort);
 // accumulator layout probe for the kernels above: out[tid * 64 + i] = (row << 16 | token) of element i, out[tid * 64 + 63] = capacity
 kernel void k_layout_sg(device float * A [[buffer(2)]], constant uint & out_off [[buffer(5)]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup half sa[HB_M * HB_K];
