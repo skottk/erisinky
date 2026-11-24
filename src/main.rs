@@ -536,47 +536,78 @@ fn main() {
             // the GPU's first touch of a page cost?
             let src = "#include <metal_stdlib>\nusing namespace metal;\nkernel void k_w(device uint * B [[buffer(0)]], constant uint2 & a [[buffer(1)]], uint gid [[thread_position_in_grid]]) { B[a.x + gid * a.y] += gid + 1; }\n";
             let gpu = metal::Gpu::new(src, &["k_w"]);
-            let foot = || unsafe { let mut ri: libc::rusage_info_v4 = std::mem::zeroed(); libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t); ri.ri_phys_footprint as f64 / 1048576.0 };
+            let foot = || {
+                // SAFETY: `rusage_info_v4` is a plain C POD struct initialized to zero and passed
+                // by valid mutable pointer to `proc_pid_rusage` for the current process.
+                unsafe {
+                    let mut ri: libc::rusage_info_v4 = std::mem::zeroed();
+                    libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t);
+                    ri.ri_phys_footprint as f64 / 1048576.0
+                }
+            };
             let len = 1usize << 30;
             let f0 = foot();
-            let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) } as *mut u8;
-            let buf = gpu.buffer_nocopy(ptr, len);
+            let map = AnonMap::new(len).unwrap_or_else(|e| die(format!("mmap {len} bytes: {e}")));
+            let ptr = map.as_mut_ptr();
+            let buf = gpu.buffer_nocopy(ptr, map.len());
             println!("footprint: start {f0:.1} MiB, after wrapping 1 GiB of untouched memory {:.1} MiB", foot());
-            let run = |first: u32, stride: u32, n: usize| {
-                let cb = gpu.cmd(); let e = metal::Enc::new(&cb);
-                e.pso(&gpu.pso("k_w")); e.buf(&buf, 0, 0); e.bytes(&[first, stride], 1);
-                e.dispatch((n.div_ceil(64), 1, 1), 64); e.end();
-                let t = std::time::Instant::now(); cb.commit(); cb.waitUntilCompleted(); t.elapsed().as_secs_f64() * 1e3
-            };
-            let mib = |m: usize| (m << 18) as u32;      // MiB -> uint index
-            let rd = |m: usize| unsafe { *(ptr.add(m << 20) as *const u32) };
-            let mut last = foot();
-            // pages of the mapping that physically exist (the footprint ledger does not see pages only the GPU has touched)
-            let resident = || { let mut v = vec![0i8; len / 16384]; unsafe { libc::mincore(ptr as *mut libc::c_void, len, v.as_mut_ptr()); } v.iter().filter(|&&x| x & 1 != 0).count() as f64 * 16384.0 / 1048576.0 };
-            let mut lastr = resident();
-            let mut step = |what: &str, ms: f64| { let (f, r) = (foot(), resident()); println!("{what}: {ms:.2} ms, footprint {:+.2} MiB (now {f:.1}), resident in the mapping {:+.2} MiB (now {r:.1})", f - last, r - lastr); last = f; lastr = r; };
-            step("GPU writes one word at 0", run(0, 1, 1));
-            step("GPU writes one word at 0 again", run(0, 1, 1));
-            step("GPU writes one word at 1 MiB", run(mib(1), 1, 1));
-            step("GPU writes one word at 100 MiB", run(mib(100), 1, 1));
-            step("GPU writes one word at 101 MiB", run(mib(101), 1, 1));
-            step("GPU writes one word at 132 MiB", run(mib(132), 1, 1));
-            step("GPU writes one word at 164 MiB", run(mib(164), 1, 1));
-            step("GPU writes 4 MiB dense at 200 MiB", run(mib(200), 1, 1 << 20));
-            step("GPU writes 4 MiB dense at 200 MiB again", run(mib(200), 1, 1 << 20));
-            step("GPU writes 32 MiB dense at 300 MiB", run(mib(300), 1, 8 << 20));
-            step("GPU writes 32 MiB dense at 300 MiB again", run(mib(300), 1, 8 << 20));
-            for i in 0..2048usize { unsafe { *ptr.add((400 << 20) + i * 16384) = 1; } }
-            step("CPU touches 32 MiB at 400 MiB", 0.0);
-            step("GPU writes 32 MiB dense at 400 MiB (CPU-touched)", run(mib(400), 1, 8 << 20));
-            step("GPU writes 32 MiB dense at 400 MiB again", run(mib(400), 1, 8 << 20));
-            println!("readback: {} {} {} {} (expect 2 1 1 2)", rd(0), rd(1), rd(100), rd(200));
-            // one fresh page per dispatch
-            let mut tf = 0.0; let mut tw = 0.0;
-            for i in 0..200u32 { tf += run(mib(600) + i * 4096, 1, 64); }
-            for i in 0..200u32 { tw += run(mib(600) + i * 4096, 1, 64); }
-            step("200 dispatches, one fresh page each", tf);
-            println!("per dispatch: fresh page {:.1} us, touched page {:.1} us", tf * 5.0, tw * 5.0);
+            {
+                let run = |first: u32, stride: u32, n: usize| {
+                    let cb = gpu.cmd(); let e = metal::Enc::new(&cb);
+                    e.pso(&gpu.pso("k_w")); e.buf(&buf, 0, 0); e.bytes(&[first, stride], 1);
+                    e.dispatch((n.div_ceil(64), 1, 1), 64); e.end();
+                    let t = std::time::Instant::now(); cb.commit(); cb.waitUntilCompleted(); t.elapsed().as_secs_f64() * 1e3
+                };
+                let mib = |m: usize| (m << 18) as u32;      // MiB -> uint index
+                let rd = |m: usize| {
+                    // SAFETY: `map` owns a live `1 GiB` mapping (`len = 1 << 30`), `m << 20` is
+                    // page-aligned (and 4-byte aligned for `u32`), and all callers pass `m <= 200`.
+                    unsafe { *(ptr.add(m << 20) as *const u32) }
+                };
+                let mut last = foot();
+                // pages of the mapping that physically exist (the footprint ledger does not see pages only the GPU has touched)
+                let resident = || {
+                    let mut v = vec![0i8; len / 16384];
+                    // SAFETY: `ptr..ptr+len` is the live page-aligned mapping owned by `map`, and
+                    // `v` has `len / 16384` bytes for macOS 16 KiB pages.
+                    unsafe { libc::mincore(ptr as *mut libc::c_void, len, v.as_mut_ptr()); }
+                    v.iter().filter(|&&x| x & 1 != 0).count() as f64 * 16384.0 / 1048576.0
+                };
+                let mut lastr = resident();
+                let mut step = |what: &str, ms: f64| { let (f, r) = (foot(), resident()); println!("{what}: {ms:.2} ms, footprint {:+.2} MiB (now {f:.1}), resident in the mapping {:+.2} MiB (now {r:.1})", f - last, r - lastr); last = f; lastr = r; };
+                step("GPU writes one word at 0", run(0, 1, 1));
+                step("GPU writes one word at 0 again", run(0, 1, 1));
+                step("GPU writes one word at 1 MiB", run(mib(1), 1, 1));
+                step("GPU writes one word at 100 MiB", run(mib(100), 1, 1));
+                step("GPU writes one word at 101 MiB", run(mib(101), 1, 1));
+                step("GPU writes one word at 132 MiB", run(mib(132), 1, 1));
+                step("GPU writes one word at 164 MiB", run(mib(164), 1, 1));
+                step("GPU writes 4 MiB dense at 200 MiB", run(mib(200), 1, 1 << 20));
+                step("GPU writes 4 MiB dense at 200 MiB again", run(mib(200), 1, 1 << 20));
+                step("GPU writes 32 MiB dense at 300 MiB", run(mib(300), 1, 8 << 20));
+                step("GPU writes 32 MiB dense at 300 MiB again", run(mib(300), 1, 8 << 20));
+                for i in 0..2048usize {
+                    // SAFETY: `(400 << 20) + 2047 * 16384 < (432 << 20) < len` (`1 GiB`), and no
+                    // GPU command buffer is in flight.
+                    unsafe { *ptr.add((400 << 20) + i * 16384) = 1; }
+                }
+                step("CPU touches 32 MiB at 400 MiB", 0.0);
+                step("GPU writes 32 MiB dense at 400 MiB (CPU-touched)", run(mib(400), 1, 8 << 20));
+                step("GPU writes 32 MiB dense at 400 MiB again", run(mib(400), 1, 8 << 20));
+                println!("readback: {} {} {} {} (expect 2 1 1 2)", rd(0), rd(1), rd(100), rd(200));
+                // one fresh page per dispatch
+                let mut tf = 0.0; let mut tw = 0.0;
+                for i in 0..200u32 { tf += run(mib(600) + i * 4096, 1, 64); }
+                for i in 0..200u32 { tw += run(mib(600) + i * 4096, 1, 64); }
+                step("200 dispatches, one fresh page each", tf);
+                println!("per dispatch: fresh page {:.1} us, touched page {:.1} us", tf * 5.0, tw * 5.0);
+            }
+            // Wait for all GPU work referencing `buf` to finish, then release the Metal buffer
+            // before unmapping its backing anonymous pages (`map` is also declared before `buf`
+            // so unwind drop order is always `buf` then `map`).
+            gpu.drain();
+            drop(buf);
+            drop(map);
         }
         "kvprune" => {
             // dev: what does evicting far keys of the full-attention layers cost? Prefill the prompt, decode -n tokens with the
@@ -711,3 +742,141 @@ fn main() {
     }
 }
 
+#[cfg(test)]
+static ANON_MAP_DROP_MUNMAP_OK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII guard for a private read-write anonymous `mmap` region.
+///
+/// Rejects zero-length requests and checks `MAP_FAILED` on creation, then
+/// unmaps the region via `libc::munmap` on drop.
+struct AnonMap {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl AnonMap {
+    fn new(len: usize) -> std::io::Result<Self> {
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "anonymous mmap length must be non-zero",
+            ));
+        }
+        // SAFETY: `addr` is null (kernel picks a page-aligned address), `fd` is `-1` and
+        // `offset` is `0` as required by `MAP_ANON | MAP_PRIVATE`, and `len > 0`.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if raw == libc::MAP_FAILED || raw.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            ptr: raw as *mut u8,
+            len,
+        })
+    }
+
+    fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(test)]
+    fn try_unmap(self) -> std::io::Result<()> {
+        let ptr = self.ptr;
+        let len = self.len;
+        std::mem::forget(self);
+        // SAFETY: `ptr` and `len` came from a successful `libc::mmap` in `AnonMap::new`,
+        // and `std::mem::forget(self)` prevents `Drop` from double-unmapping them.
+        let rc = unsafe { libc::munmap(ptr as *mut libc::c_void, len) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+impl Drop for AnonMap {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` and `self.len` came from a successful `libc::mmap` in
+        // `AnonMap::new`, remain mapped until `Drop`, and are unmapped exactly once.
+        let rc = unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+        debug_assert_eq!(rc, 0, "munmap failed: {}", std::io::Error::last_os_error());
+        #[cfg(test)]
+        if rc == 0 {
+            ANON_MAP_DROP_MUNMAP_OK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+mod anon_map_tests {
+    use super::{AnonMap, ANON_MAP_DROP_MUNMAP_OK};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn anon_map_zero_len_returns_err() {
+        let err = AnonMap::new(0).err().expect("len=0 must return Err");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn anon_map_usize_max_checks_map_failed() {
+        let res = AnonMap::new(usize::MAX);
+        assert!(
+            res.is_err(),
+            "AnonMap::new(usize::MAX) must fail cleanly instead of returning MAP_FAILED"
+        );
+    }
+
+    #[test]
+    fn anon_map_valid_16k_aligned_writable_and_drops_cleanly() {
+        // SAFETY: `sysconf(_SC_PAGESIZE)` is always safe to call and returns a positive page size on macOS/POSIX.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        assert!(page_size > 0 && page_size.is_power_of_two());
+
+        let before = ANON_MAP_DROP_MUNMAP_OK.load(Ordering::SeqCst);
+        let map = AnonMap::new(16384).expect("16 KiB anonymous mapping should succeed");
+        assert_eq!(map.len(), 16384);
+        let ptr = map.as_mut_ptr();
+        assert!(!ptr.is_null());
+        assert_eq!(
+            (ptr as usize) % page_size,
+            0,
+            "mapping pointer {ptr:p} must be aligned to page size {page_size}"
+        );
+
+        // SAFETY: `map` owns 16384 writable bytes; offsets 0 and 16383 are in bounds.
+        unsafe {
+            *ptr = 0x5A;
+            *ptr.add(16383) = 0xA5;
+            assert_eq!(*ptr, 0x5A);
+            assert_eq!(*ptr.add(16383), 0xA5);
+        }
+
+        drop(map);
+        let after = ANON_MAP_DROP_MUNMAP_OK.load(Ordering::SeqCst);
+        assert!(
+            after > before,
+            "Drop must invoke munmap and succeed (rc == 0): before={before}, after={after}"
+        );
+    }
+
+    #[test]
+    fn anon_map_try_unmap_succeeds() {
+        let map = AnonMap::new(16384).expect("16 KiB anonymous mapping should succeed");
+        map.try_unmap().expect("munmap should return 0");
+    }
+}

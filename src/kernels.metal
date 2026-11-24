@@ -436,7 +436,7 @@ kernel void k_norm(device const uchar * PB [[buffer(1)]], device float * A [[buf
 // loop controller: g = D . [rmsnorm(u); rmsnorm(m)]  (D: 64 x 4608 bf16). grid: nC*16 TGs of 128 threads (1 row / simdgroup)
 
 struct CtrlJob { uint u_off, m_off, d_off, out_off, gain_off, forget_off, res_out, ss_off; int norm_w; uint ctr; };
-struct CtrlArgs { uint nC; uint tstride; uint pad1, pad2; CtrlJob job[4]; };
+struct CtrlArgs { uint nC; uint tstride; float eps; uint pad; CtrlJob job[4]; };
 
 kernel void k_ctrl_down(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], constant CtrlArgs & a [[buffer(5)]],
                         uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
@@ -499,7 +499,7 @@ kernel void k_ctrl_apply(device const uchar * PB [[buffer(1)]], device float * A
     if (J.norm_w >= 0 && last_tg(CTR + J.ctr, ntg.x, tid, &flag)) {
         float t = 0;
         for (uint i = 0; i < ntg.x; i++) t += A[J.ss_off + tok * 128 + i];
-        const float r = rsqrt(t / E + 1e-6f);
+        const float r = rsqrt(t / E + a.eps);
         device const float * w = (device const float *) (PB + J.norm_w);
         for (uint i = tid; i < E; i += 256) A[J.res_out + toff + i] *= r * w[i];
     }
