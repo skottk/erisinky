@@ -1,0 +1,45 @@
+Read the following, critique the argument, and recommend some concrete steps
+
+While unit tests are faster and less flaky, it’s possible to pass them and still break the feature. This is because both the agent and the test don’t understand the full task.
+
+With E2E tests, it is effective to give your agent hands and eyes on the real running system. You can use a skill to boot, drive, and inspect the app with tools like CDP, simulators, or API harnesses.
+
+The feature map can serve as a guide and grading rubric for agents as they typically list features from the user’s point of view with descriptions of paths, keyboard shortcuts, selectors, and expected results.
+
+Property tests: constraints that can’t break
+
+A lot of tests are based on what you thought might go wrong. Property tests look at the edge cases that people tend to miss, which is where agents often fail.
+
+You start by writing a statement you think can’t fail and then use a test library (fast-check for JS/TS, Hypothesis for Python, proptest for Rust, etc.) to generate thousands of inputs that try to prove otherwise.
+
+There are many properties in virtually every software project like:
+
+Round-trip encoding: “if you encode X then decode it back, you get X.” This works for parsing and serialization as well.
+Invariants: Things that must always be true, like “account balance can never become negative.”
+Idempotency: Doing an action (migration, normalization, retry) twice has the same effect as doing it once.
+Equivalence: Optimized code produces the same result as naive but correct code.
+Property libraries are a great way to keep agents honest by using edge cases that aren’t created with the same bias as the agent that created the original code. They are also particularly helpful for rewrites when the spec has drifted from production behavior and is no longer a reliable source for verification.
+
+Differential tests: the old system is the oracle
+
+Differential tests are particularly effective for large-scale migration use cases where functionality is expected to remain the same. For these tests, you run both the old system and the new system with the same inputs and see if you get different results. If you do, there is a bug or breaking change that needs to be fixed.
+
+The key for differential tests is to use randomly generated inputs or a sample of production traffic. You’ll also want to normalize irrelevant factors like whitespace and keep a list of approved changes for situations where the new environment should differ from the old.
+
+HOW THE CLAUDE CODE TEAM THINKS ABOUT VERIFICATION
+
+We have previously written about how code review works at Anthropic, but this article aims to go deeper on how we verify our work.
+
+Verification means running the change
+
+Running the app end to end matters more than tests. You wouldn't ship an iOS change without trying it in a simulator, and the same goes for Claude.
+
+Claude can test the whole app the way a human or QA engineer would. Ask it to use the Claude Chrome extension for web changes, an iOS or Android MCP for mobile, computer use for desktop, or to run the service locally for backend work.
+
+To codify how to start the simulator or run your app, create a skill called verify. Put it in a .claude/skills/ folder in your repo, as close to the relevant code as you can, and add as many as you need. Claude knows to use the verify skill before committing changes.
+
+Then invest in making your verify skill fast and reliable. Ask Claude to iterate on it and stress test it. It's your smoke test harness, so you want it rock solid.
+
+When you give Claude a way to smoke test its changes end to end, you get much better results. You'll see it iterate and catch real mistakes faster, the way a human would. This is how we test nearly all changes at Anthropic.
+
+
