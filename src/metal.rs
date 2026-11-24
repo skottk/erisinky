@@ -12,11 +12,27 @@ pub type Buf = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub type Pso = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub type CmdBuf = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 
+/// Private wrapper around `CmdBuf` stored in `Gpu::inflight` so `Gpu` preserves its
+/// existing `Send` (and `!Sync`) contract for callers like `Mutex<Gpu>`.
+struct TrackedCmdBuf(CmdBuf);
+
+// SAFETY: `Gpu` is `!Sync` (due to `RefCell`), so a `TrackedCmdBuf` can only cross thread
+// boundaries when `Gpu` is exclusively owned (e.g., locked inside a `Mutex<Gpu>`).
+// Apple Metal permits calling `status()` and `waitUntilCompleted()` on a command buffer
+// from any thread provided access is externally synchronized.
+unsafe impl Send for TrackedCmdBuf {}
+
 pub struct Gpu {
     pub dev: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     lib: Retained<ProtocolObject<dyn MTLLibrary>>,
     psos: std::cell::RefCell<HashMap<String, Pso>>,
+    /// Tracks command buffers issued by `cmd()` so `drain()` / `Drop` can wait for
+    /// all committed GPU work before backing buffers or mmaps are released.
+    inflight: std::cell::RefCell<Vec<TrackedCmdBuf>>,
+    /// Optional A/B benchmark override (`INK_UNRETAINED_CMD=1`); defaults to `false`
+    /// (retained references) for unwind safety.
+    unretained: bool,
 }
 
 impl Gpu {
@@ -29,9 +45,25 @@ impl Gpu {
         let lib = dev
             .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
             .unwrap_or_else(|e| panic!("Metal compile failed:\n{}", e.localizedDescription()));
-        let g = Gpu { dev, queue, lib, psos: Default::default() };
+        let unretained = std::env::var("INK_UNRETAINED_CMD")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let g = Gpu {
+            dev,
+            queue,
+            lib,
+            psos: Default::default(),
+            inflight: Default::default(),
+            unretained,
+        };
         for k in kernels { g.pso(k); }
         g
+    }
+
+    /// Returns `true` when `cmd()` allocates command buffers with retained resource references
+    /// (the default for unwind safety).
+    pub fn uses_retained_references(&self) -> bool {
+        !self.unretained
     }
 
     /// pipeline state by kernel name (compiled on first use; production kernels are pre-built at load)
@@ -63,7 +95,51 @@ impl Gpu {
         }
     }
 
-    pub fn cmd(&self) -> CmdBuf { self.queue.commandBufferWithUnretainedReferences().expect("cmdbuf") }
+    /// Create a command buffer tracked by this `Gpu`.
+    ///
+    /// Uses retained references (`commandBuffer()`) by default so Metal keeps all bound
+    /// buffers and pipeline states alive across panics/unwinds. Set `INK_UNRETAINED_CMD=1`
+    /// only for A/B benchmarking retained vs. unretained command buffer overhead.
+    pub fn cmd(&self) -> CmdBuf {
+        let cb = if self.unretained {
+            self.queue.commandBufferWithUnretainedReferences().expect("cmdbuf")
+        } else {
+            self.queue.commandBuffer().expect("cmdbuf")
+        };
+        let mut inflight = self.inflight.borrow_mut();
+        inflight.retain(|c| {
+            let st = c.0.status();
+            st != MTLCommandBufferStatus::Completed && st != MTLCommandBufferStatus::Error
+        });
+        inflight.push(TrackedCmdBuf(cb.clone()));
+        cb
+    }
+
+    /// Block until all committed in-flight command buffers created from this `Gpu` complete.
+    ///
+    /// Skips uncommitted (`NotEnqueued`), already `Completed`, and `Error` command buffers
+    /// so draining during unwind cannot block indefinitely on a never-committed buffer.
+    pub fn drain(&self) {
+        let pending = match self.inflight.try_borrow_mut() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(_) => return,
+        };
+        for TrackedCmdBuf(cb) in pending {
+            let st = cb.status();
+            if st != MTLCommandBufferStatus::NotEnqueued
+                && st != MTLCommandBufferStatus::Completed
+                && st != MTLCommandBufferStatus::Error
+            {
+                cb.waitUntilCompleted();
+            }
+        }
+    }
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        self.drain();
+    }
 }
 
 pub struct Enc {

@@ -231,7 +231,7 @@ kernel void k_embed(device const uchar * W [[buffer(0)]], device const uchar * P
 // depth attention ("block attention residuals"): out_q = sum_i softmax_i(q . n_i / sqrt(E)) n_i, n_i = rmsnorm(s_i)
 // optionally followed by RMSNorm with a weight. q_off < 0: identity (out = raw s_0). One threadgroup per job, 256 threads.
 
-// hcopy / hout: fp16 destinations of the batched kernel (normalized copies with row stride hstride halves; (normed) outputs
+// hcopy / hout: fp16 destinations (normalized copies with row stride hstride halves; (normed) outputs
 // with row stride E halves). nof32 bit q: output q is only wanted in fp16.
 struct MixJob { uint nS, nQ; uint s_off[6]; int q_off; uint out_off[4]; int norm_off[4]; float eps; uint tstride; int ncopy[4][3]; uint pad_t;
                 int hcopy[4][3]; int hout[4]; uint hstride, nof32; };
@@ -306,13 +306,31 @@ kernel void k_mix(device const uchar * PB [[buffer(1)]], device float * A [[buff
         float t = 0; for (int g = 0; g < 24; g++) t += sh2[g][q];
         // plain RMSNorm copies (eps 1e-6, no weight) for the loop controllers' inputs
         const float rn = rsqrt(t / E + 1e-6f);
-        for (int c = 0; c < 3; c++) if (J.ncopy[q][c] >= 0) for (int k = 0; k < 3; k++) A[J.ncopy[q][c] + toff + tid + k * 768] = o[q][k] * rn;
+        for (int c = 0; c < 3; c++) {
+            if (J.ncopy[q][c] >= 0) for (int k = 0; k < 3; k++) A[J.ncopy[q][c] + toff + tid + k * 768] = o[q][k] * rn;
+            if (J.hcopy[q][c] >= 0) {
+                device half * dst = (device half *) (A + J.hcopy[q][c]) + (ulong) tgp.y * J.hstride;
+                for (int k = 0; k < 3; k++) dst[tid + k * 768] = half(o[q][k] * rn);
+            }
+        }
+        float out_v[3];
         if (J.norm_off[q] >= 0) {
             const float r = rsqrt(t / E + J.eps);
             device const float * w = (device const float *) (PB + J.norm_off[q]);
-            for (int k = 0; k < 3; k++) A[J.out_off[q] + toff + tid + k * 768] = o[q][k] * r * w[tid + k * 768];
+            #pragma unroll
+            for (int k = 0; k < 3; k++) out_v[k] = o[q][k] * r * w[tid + k * 768];
         } else {
-            for (int k = 0; k < 3; k++) A[J.out_off[q] + toff + tid + k * 768] = o[q][k];
+            #pragma unroll
+            for (int k = 0; k < 3; k++) out_v[k] = o[q][k];
+        }
+        if (J.hout[q] >= 0) {
+            device half * dst = (device half *) (A + J.hout[q]) + (ulong) tgp.y * E;
+            #pragma unroll
+            for (int k = 0; k < 3; k++) dst[tid + k * 768] = half(out_v[k]);
+        }
+        if (!((J.nof32 >> q) & 1u)) {
+            #pragma unroll
+            for (int k = 0; k < 3; k++) A[J.out_off[q] + toff + tid + k * 768] = out_v[k];
         }
     }
 }

@@ -4,9 +4,39 @@ use crate::engine::Engine;
 use crate::metal::CmdBuf;
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
-use objc2_metal::MTLCommandBuffer;
+use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+
+/// RAII guard for in-flight Metal command buffers: ensures every committed `CmdBuf`
+/// finishes on the GPU even if a callback (such as `on_token`) panics and unwinds.
+pub struct InflightGuard(pub VecDeque<(usize, CmdBuf)>);
+
+impl InflightGuard {
+    pub fn new() -> Self {
+        Self(VecDeque::new())
+    }
+}
+
+impl Default for InflightGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        while let Some((_, cb)) = self.0.pop_front() {
+            let st = cb.status();
+            if st != MTLCommandBufferStatus::NotEnqueued
+                && st != MTLCommandBufferStatus::Completed
+                && st != MTLCommandBufferStatus::Error
+            {
+                cb.waitUntilCompleted();
+            }
+        }
+    }
+}
 
 pub struct Session<'a> {
     pub eng: &'a Engine,
@@ -72,28 +102,28 @@ impl<'a> Session<'a> {
         let eng = self.eng;
         let eos = self.tk.eos;
         eng.release_batch();      // the prefill arena is not needed while generating
-        let mut tok = if sampler.greedy() { first } else { sampler.sample(eng.logits()) };
+        let mut tok = if sampler.greedy() { first } else { sampler.sample(&eng.logits()) };
         let mut n = 1usize;
         let mut stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;
         if sampler.greedy() {
             if stop { self.pending = Some(tok); }
             else {
                 eng.set_tokens(self.n_past, &[tok]);
-                let mut inflight: VecDeque<(usize, CmdBuf)> = VecDeque::new();
+                let mut inflight = InflightGuard::new();
                 let step = |pos: usize| (pos, eng.step(pos, true, true));
                 eng.gen_reserve(self.n_past);
-                inflight.push_back(step(self.n_past));
+                inflight.0.push_back(step(self.n_past));
                 loop {
-                    if inflight.len() < 2 {
-                        let pos = inflight.back().unwrap().0 + 1;
+                    if inflight.0.len() < 2 {
+                        let pos = inflight.0.back().unwrap().0 + 1;
                         if pos >= eng.gen_capacity() {
                             // the K/V buffers must grow (or, with --kv-disk, be re-sized): nothing may be in flight meanwhile
-                            for (_, cb) in inflight.iter() { cb.waitUntilCompleted(); }
+                            for (_, cb) in inflight.0.iter() { cb.waitUntilCompleted(); }
                             eng.gen_reserve(pos);
                         }
-                        inflight.push_back(step(pos));
+                        inflight.0.push_back(step(pos));
                     }
-                    let (pos, cb) = inflight.pop_front().unwrap();
+                    let (pos, cb) = inflight.0.pop_front().unwrap();
                     cb.waitUntilCompleted();
                     self.n_past = pos + 1;
                     tok = eng.token_at(pos + 1);
@@ -101,7 +131,7 @@ impl<'a> Session<'a> {
                     stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 3;
                     if stop {
                         // the remaining in-flight step consumes `tok` (a real token): keep it in the context
-                        match inflight.pop_front() {
+                        match inflight.0.pop_front() {
                             Some((p2, cb2)) => { cb2.waitUntilCompleted(); self.n_past = p2 + 1; self.pending = None; }
                             None => self.pending = Some(tok),
                         }
@@ -115,7 +145,7 @@ impl<'a> Session<'a> {
                 eng.gen_reserve(self.n_past);
                 eng.step(self.n_past, true, false).waitUntilCompleted();
                 self.n_past += 1;
-                tok = sampler.sample(eng.logits());
+                tok = sampler.sample(&eng.logits());
                 n += 1;
                 stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;
             }
