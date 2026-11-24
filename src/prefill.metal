@@ -222,7 +222,7 @@ kernel void k_topk_b(device const uchar * PB [[buffer(1)]], device float * A [[b
         const float mv = simd_max(bv);
         const int win = simd_min((bv == mv) ? (int) (lane * 4 + bi) : 1 << 20);
         const float pw = simd_shuffle(pr[win % 4], (ushort) (win / 4));
-        if ((int) (lane * 4 + bi) == win) sel[bi] = -INFINITY;
+        if ((int) (lane * 4 + bi) == win) sel[bi] = NEG_INF_F;
         if (lane == (ushort) k) { myid = win; myw = pw; }
         wsum += pw;
     }
@@ -532,7 +532,7 @@ kernel void k_attn_b(device const uchar * PB [[buffer(1)]], device float * A [[b
         for (uint i = tid; i < AQT * 3 * 32; i += 128) {
             const uint row = i / 32, j = i % 32, tt = row / 3;
             const uint qp = a.p0 + t0 + tt, kp = kc + j;
-            float s = -INFINITY;
+            float s = NEG_INF_F;
             if (j < nk && tt < nq && kp <= qp && (a.window == 0 || qp - kp < a.window)) {
                 float acc = 0;
                 for (int d4 = 0; d4 < HD / 4; d4++)
@@ -744,7 +744,7 @@ kernel void k_attn_bt(device const uchar * PB [[buffer(1)]], device float * A [[
             for (short ii = 0; ii < FCK / 32; ii++) {
                 const uint col = ii * 32 + tiisg, kp = kc + col;
                 const bool valid = j < nq && kp <= qp && (a.window == 0 || qp - kp < a.window);
-                float v = -INFINITY;
+                float v = NEG_INF_F;
                 if (valid) {
 #ifdef KV8
                     v = ss[j * FCK + col] * ksc[ii] - sk[j];
@@ -880,8 +880,8 @@ kernel void k_attn_h(device const uchar * PB [[buffer(1)]], device float * A [[b
                 const int d0 = D0 + int(j) - int(lane), d1 = d0 - 32;
                 if (bias && d0 < EXT) s0 += G[j * AG + clamp(d0 - dlo, 0, AG - 1)];
                 if (bias && d1 < EXT) s1 += G[j * AG + clamp(d1 - dlo, 0, AG - 1)];
-                if (!(j < nq && d0 >= 0 && (a.window == 0 || d0 < (int) a.window))) s0 = -INFINITY;
-                if (!(j < nq && d1 >= 0 && (a.window == 0 || d1 < (int) a.window))) s1 = -INFINITY;
+                if (!(j < nq && d0 >= 0 && (a.window == 0 || d0 < (int) a.window))) s0 = NEG_INF_F;
+                if (!(j < nq && d1 >= 0 && (a.window == 0 || d1 < (int) a.window))) s1 = NEG_INF_F;
             }
             const float m = simd_max(max(M[jj], max(s0, s1)));
             const float ms = exp(M[jj] - m);
@@ -1016,7 +1016,7 @@ kernel void k_mix_b(device const uchar * PB [[buffer(1)]], device float * A [[bu
             #pragma unroll
             for (int i = 0; i < NS; i++) al[q][i] = i == 0 ? 1.0f : 0.0f;
         } else {
-            float sc[NS], mx = -INFINITY;
+            float sc[NS], mx = NEG_INF_F;
             #pragma unroll
             for (int i = 0; i < NS; i++) { sc[i] = rsqrt(G[i][i] / E + 1e-6f) * D[i][q] * (1.0f / 48.0f); mx = max(mx, sc[i]); }
             float den = 0;

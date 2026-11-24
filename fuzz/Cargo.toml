@@ -1,0 +1,39 @@
+[package]
+name = "inkling-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+
+[dependencies.inkling]
+path = ".."
+
+[[bin]]
+name = "fuzz_gguf"
+path = "fuzz_targets/fuzz_gguf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tokenizer"
+path = "fuzz_targets/fuzz_tokenizer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_renderer"
+path = "fuzz_targets/fuzz_renderer.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -81,9 +81,11 @@ impl Tokenizer {
         self.specials.iter().find(|(s, _)| s == tok).map(|&(_, id)| id)
     }
 
-    /// Raw bytes of one token (special tokens rendered literally).
+    /// Raw bytes of one token (special tokens rendered literally; out-of-range IDs return empty).
     pub fn decode_bytes(&self, id: u32) -> Vec<u8> {
-        let t = &self.id_to_tok[id as usize];
+        let Some(t) = self.id_to_tok.get(id as usize) else {
+            return Vec::new();
+        };
         if self.is_special(id) { return t.as_bytes().to_vec(); }
         let mut out = Vec::with_capacity(t.len());
         for ch in t.chars() {

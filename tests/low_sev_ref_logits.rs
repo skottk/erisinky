@@ -502,13 +502,19 @@ fn compiled_binary() -> &'static CompiledBinary {
         fs::write(&stub, MOCK_LLAMA_STUB_CPP).expect("write mock llama_stub.cpp");
         fs::write(&dummy_model, b"GGUF").expect("write dummy model file");
 
-        let out = Command::new("c++")
-            .arg("-std=c++17")
+        let mut cxx = Command::new("c++");
+        cxx.arg("-std=c++17")
             .arg("-Wall")
             .arg("-Wextra")
             .arg("-Werror")
             .arg("-O0")
-            .arg("-g")
+            .arg("-g");
+        if let Ok(extra) = std::env::var("REF_LOGITS_EXTRA_CXXFLAGS") {
+            for flag in extra.split_whitespace() {
+                cxx.arg(flag);
+            }
+        }
+        let out = cxx
             .arg("-I")
             .arg(&inc_dir)
             .arg(ref_logits_cpp_path())

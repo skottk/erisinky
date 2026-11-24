@@ -6,4 +6,7 @@
 /ref/*.logits
 /ref/*.log
 /tools/ref_logits
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
 .DS_Store

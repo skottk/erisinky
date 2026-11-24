@@ -9,9 +9,12 @@ use std::io::{Error, ErrorKind, Result};
 use std::os::unix::io::AsRawFd;
 
 pub const T_F32: u32 = 0;
+pub const T_F16: u32 = 1;
+pub const T_Q4_0: u32 = 2;
 pub const T_Q5_0: u32 = 6;
 pub const T_Q8_0: u32 = 8;
 pub const T_Q4_K: u32 = 12;
+pub const T_Q5_K: u32 = 13;
 pub const T_Q6_K: u32 = 14;
 pub const T_BF16: u32 = 30;
 
@@ -22,14 +25,14 @@ fn invalid_data(msg: impl Into<String>) -> Error {
 /// Checked lookup of `(bytes per block, elements per block)` for a ggml tensor type.
 pub fn try_type_block(t: u32) -> Result<(usize, usize)> {
     match t {
-        0 => Ok((4, 1)),
-        1 | 30 => Ok((2, 1)),
-        2 => Ok((18, 32)),
-        6 => Ok((22, 32)),
-        8 => Ok((34, 32)),
-        12 => Ok((144, 256)),
-        13 => Ok((176, 256)),
-        14 => Ok((210, 256)),
+        T_F32 => Ok((4, 1)),
+        T_F16 | T_BF16 => Ok((2, 1)),
+        T_Q4_0 => Ok((18, 32)),
+        T_Q5_0 => Ok((22, 32)),
+        T_Q8_0 => Ok((34, 32)),
+        T_Q4_K => Ok((144, 256)),
+        T_Q5_K => Ok((176, 256)),
+        T_Q6_K => Ok((210, 256)),
         _ => Err(invalid_data(format!("unsupported ggml type {t}"))),
     }
 }
@@ -41,8 +44,135 @@ pub fn type_block(t: u32) -> (usize, usize) {
 
 pub fn type_name(t: u32) -> &'static str {
     match t {
-        0 => "F32", 1 => "F16", 30 => "BF16", 2 => "Q4_0", 6 => "Q5_0", 8 => "Q8_0",
-        12 => "Q4_K", 13 => "Q5_K", 14 => "Q6_K", _ => "?",
+        T_F32 => "F32",
+        T_F16 => "F16",
+        T_BF16 => "BF16",
+        T_Q4_0 => "Q4_0",
+        T_Q5_0 => "Q5_0",
+        T_Q8_0 => "Q8_0",
+        T_Q4_K => "Q4_K",
+        T_Q5_K => "Q5_K",
+        T_Q6_K => "Q6_K",
+        _ => "?",
+    }
+}
+
+/// Non-finite weight or quantization scale offender found during a GGUF finiteness audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightOffender {
+    pub tensor: String,
+    pub ty: u32,
+    pub non_finite: u64,
+}
+
+/// Summary of a load-time finiteness scan across all tensors in a [`Gguf`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightAuditReport {
+    pub tensors_checked: usize,
+    pub blocks_checked: u64,
+    pub non_finite_count: u64,
+    pub offenders: Vec<WeightOffender>,
+}
+
+impl WeightAuditReport {
+    pub fn is_clean(&self) -> bool {
+        self.non_finite_count == 0
+    }
+}
+
+#[inline]
+fn is_f32_non_finite(bits: u32) -> bool {
+    (bits & 0x7F80_0000) == 0x7F80_0000
+}
+
+#[inline]
+fn is_f16_non_finite(bits: u16) -> bool {
+    (bits & 0x7C00) == 0x7C00
+}
+
+#[inline]
+fn is_bf16_non_finite(bits: u16) -> bool {
+    (bits & 0x7F80) == 0x7F80
+}
+
+/// Scan a single tensor's raw bytes for non-finite values or quantization scale headers.
+/// Returns `(blocks_checked, non_finite_count)`.
+///
+/// Quantized block layouts match `src/kernels.metal` / GGML:
+/// - `Q4_0` (18B), `Q5_0` (22B), `Q8_0` (34B): fp16 `d` at `0..2`
+/// - `Q4_K` (144B), `Q5_K` (176B): fp16 `d` at `0..2`, fp16 `dmin` at `2..4`
+/// - `Q6_K` (210B): fp16 `d` at `208..210`
+fn audit_tensor_bytes(ty: u32, data: &[u8]) -> (u64, u64) {
+    let mut bad = 0u64;
+    match ty {
+        T_F32 => {
+            let chunks = data.as_chunks::<4>().0;
+            for &c in chunks {
+                bad += is_f32_non_finite(u32::from_le_bytes(c)) as u64;
+            }
+            (chunks.len() as u64, bad)
+        }
+        T_F16 => {
+            let chunks = data.as_chunks::<2>().0;
+            for &c in chunks {
+                bad += is_f16_non_finite(u16::from_le_bytes(c)) as u64;
+            }
+            (chunks.len() as u64, bad)
+        }
+        T_BF16 => {
+            let chunks = data.as_chunks::<2>().0;
+            for &c in chunks {
+                bad += is_bf16_non_finite(u16::from_le_bytes(c)) as u64;
+            }
+            (chunks.len() as u64, bad)
+        }
+        T_Q4_0 => {
+            let chunks = data.as_chunks::<18>().0;
+            for b in chunks {
+                bad += is_f16_non_finite(u16::from_le_bytes([b[0], b[1]])) as u64;
+            }
+            (chunks.len() as u64, bad)
+        }
+        T_Q5_0 => {
+            let chunks = data.as_chunks::<22>().0;
+            for b in chunks {
+                bad += is_f16_non_finite(u16::from_le_bytes([b[0], b[1]])) as u64;
+            }
+            (chunks.len() as u64, bad)
+        }
+        T_Q8_0 => {
+            let chunks = data.as_chunks::<34>().0;
+            for b in chunks {
+                bad += is_f16_non_finite(u16::from_le_bytes([b[0], b[1]])) as u64;
+            }
+            (chunks.len() as u64, bad)
+        }
+        T_Q4_K => {
+            let chunks = data.as_chunks::<144>().0;
+            for b in chunks {
+                let d = u16::from_le_bytes([b[0], b[1]]);
+                let dmin = u16::from_le_bytes([b[2], b[3]]);
+                bad += is_f16_non_finite(d) as u64 + is_f16_non_finite(dmin) as u64;
+            }
+            (chunks.len() as u64, bad)
+        }
+        T_Q5_K => {
+            let chunks = data.as_chunks::<176>().0;
+            for b in chunks {
+                let d = u16::from_le_bytes([b[0], b[1]]);
+                let dmin = u16::from_le_bytes([b[2], b[3]]);
+                bad += is_f16_non_finite(d) as u64 + is_f16_non_finite(dmin) as u64;
+            }
+            (chunks.len() as u64, bad)
+        }
+        T_Q6_K => {
+            let chunks = data.as_chunks::<210>().0;
+            for b in chunks {
+                bad += is_f16_non_finite(u16::from_le_bytes([b[208], b[209]])) as u64;
+            }
+            (chunks.len() as u64, bad)
+        }
+        _ => (0, 0),
     }
 }
 
@@ -505,6 +635,102 @@ impl Gguf {
         &self.as_bytes()[t.file_off as usize..(t.file_off + t.nbytes) as usize]
     }
 
+    /// Parallel load-time finiteness audit across all tensors in this GGUF.
+    ///
+    /// For floating-point tensors (`F32`, `F16`, `BF16`) every element is checked; for
+    /// quantized tensors (`Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`) only the fp16
+    /// block scale header(s) (`d`, and `dmin` for `Q4_K`/`Q5_K`) are inspected without
+    /// dequantizing payload bytes. Offenders are returned sorted deterministically by name.
+    pub fn audit_weights_finiteness(&self) -> WeightAuditReport {
+        let mut list: Vec<&Tensor> = self.tensors.values().collect();
+        let tensors_checked = list.len();
+        if tensors_checked == 0 {
+            return WeightAuditReport {
+                tensors_checked: 0,
+                blocks_checked: 0,
+                non_finite_count: 0,
+                offenders: Vec::new(),
+            };
+        }
+
+        // Largest tensors first (LPT) so multi-threaded workers stay balanced across MoE weights.
+        list.sort_unstable_by_key(|a| std::cmp::Reverse(a.nbytes));
+
+        let max_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        let n_threads = tensors_checked.min(max_threads);
+
+        let mut blocks_checked = 0u64;
+        let mut non_finite_count = 0u64;
+        let mut offenders = Vec::new();
+
+        if n_threads <= 1 {
+            for t in list {
+                let (blocks, bad) = audit_tensor_bytes(t.ty, self.bytes(t));
+                blocks_checked += blocks;
+                if bad > 0 {
+                    non_finite_count += bad;
+                    offenders.push(WeightOffender {
+                        tensor: t.name.clone(),
+                        ty: t.ty,
+                        non_finite: bad,
+                    });
+                }
+            }
+        } else {
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let list_ref: &[&Tensor] = &list;
+            let partials: Vec<(u64, u64, Vec<WeightOffender>)> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(n_threads);
+                for _ in 0..n_threads {
+                    handles.push(s.spawn(|| {
+                        let mut local_blocks = 0u64;
+                        let mut local_bad = 0u64;
+                        let mut local_offenders = Vec::new();
+                        loop {
+                            let idx =
+                                next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if idx >= list_ref.len() {
+                                break;
+                            }
+                            let t = list_ref[idx];
+                            let (blocks, bad) = audit_tensor_bytes(t.ty, self.bytes(t));
+                            local_blocks += blocks;
+                            if bad > 0 {
+                                local_bad += bad;
+                                local_offenders.push(WeightOffender {
+                                    tensor: t.name.clone(),
+                                    ty: t.ty,
+                                    non_finite: bad,
+                                });
+                            }
+                        }
+                        (local_blocks, local_bad, local_offenders)
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("weight audit worker panicked"))
+                    .collect()
+            });
+            for (b, bad, mut offs) in partials {
+                blocks_checked += b;
+                non_finite_count += bad;
+                offenders.append(&mut offs);
+            }
+        }
+
+        offenders.sort_by(|a, b| a.tensor.cmp(&b.tensor));
+        WeightAuditReport {
+            tensors_checked,
+            blocks_checked,
+            non_finite_count,
+            offenders,
+        }
+    }
+
     /// Validate that this GGUF conforms to all `inkling2_loop` architecture invariants,
     /// tensor ranks/dimensions, quantization types, byte bounds, and vocabulary sizes
     /// required by `Engine` and its Metal kernels.
@@ -550,9 +776,13 @@ impl Gguf {
             _ => return Err(invalid_data("missing or invalid attention.sliding_window_pattern")),
         };
 
+        const MIN_RMS_EPS: f32 = 1e-12;
         let eps = self.try_f(&a("attention.layer_norm_rms_epsilon"))?;
-        if eps < 0.0 {
-            return Err(invalid_data("attention.layer_norm_rms_epsilon must be >= 0"));
+        let eps_f32 = eps as f32;
+        if !eps_f32.is_finite() || eps_f32 < MIN_RMS_EPS {
+            return Err(invalid_data(format!(
+                "attention.layer_norm_rms_epsilon ({eps}) must be finite in f32 and >= {MIN_RMS_EPS:e}"
+            )));
         }
         let _log_alpha = self.try_f(&a("attention.log_scale_alpha"))?;
         let log_floor = self.try_f(&a("attention.log_scale_floor"))?;
@@ -565,7 +795,13 @@ impl Gguf {
         }
         let _situ_lbeta = self.try_f(&a("activation.situ_linear_beta"))?;
         let _wscale = self.try_f(&a("expert_weights_scale"))?;
-        let _softcap = self.try_f(&a("final_logit_softcapping"))?;
+        let softcap = self.try_f(&a("final_logit_softcapping"))?;
+        let softcap_f32 = softcap as f32;
+        if !softcap_f32.is_finite() || softcap_f32 < 0.0 {
+            return Err(invalid_data(format!(
+                "final_logit_softcapping ({softcap}) must be finite in f32 and >= 0"
+            )));
+        }
 
         let n_vocab = self.try_u(&a("vocab_size_unpadded"))?;
         if n_vocab == 0 {
