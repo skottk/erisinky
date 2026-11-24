@@ -1,58 +1,19 @@
-mod engine;
-mod gguf;
-mod metal;
-mod sampler;
-mod session;
-mod tokenizer;
-mod unicode_tables;
-
-use engine::Engine;
+use inkling::cli::{encode_first_turn, encode_user_turn, Opts, DEFAULT_MODEL, USAGE};
+use inkling::engine::{self, Engine};
+use inkling::metal;
+use inkling::sampler::Sampler;
+use inkling::session::{Renderer, Session};
+use inkling::tokenizer::Tokenizer;
 use objc2_metal::{MTLBuffer, MTLCommandBuffer};
-use sampler::Sampler;
-use session::{Renderer, Session};
 use std::io::{BufRead, Write};
-use tokenizer::Tokenizer;
-
-const DEFAULT_MODEL: &str = "~/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf";
-
-const USAGE: &str = "inkling - a hand-fused Metal inference engine for Thinking Machines Inkling 2 Mini
-
-usage: inkling <command> [options]
-
-commands:
-  chat              interactive multi-turn chat (KV cache reused across turns)
-  run -p TEXT       one prompt, streamed
-  bench             greedy prefill + decode benchmark
-  check --ref P     compare logits against a llama.cpp reference dump (tools/ref_logits)
-
-options:
-  -m, --model PATH  GGUF file (default: LM Studio's Inkling-2-Mini Q4_K_M)
-  -p, --prompt TEXT prompt text (run/bench)      -f FILE  read the prompt from a file
-  -n N              max new tokens (default 2048, bench 128)
-  -c, --ctx N       context length (default 16384)
-  --effort E        reasoning effort: none|minimal|low|medium|high|xhigh|<0..0.99> (default high)
-  --system TEXT     system prompt
-  --temp T          temperature (default 1.0; 0 = greedy, fully GPU-pipelined)
-  --top-p P, --top-k K, --seed S
-  --greedy          same as --temp 0
-  --hide-thinking   do not print the reasoning stream
-  --kv-disk         keep only half of the (exact) K/V cache in memory while generating; the older half lives in a
-                    temporary file and is read back for every token (slower generation)
-  --kv8             8-bit K/V cache: half the cache memory, NOT exact (the default fp16 cache is)
-  --raw             do not apply the chat template; print special tokens";
-
-struct Opts {
-    model: String, prompt: String, n: usize, ctx: usize, raw: bool, effort: String, reference: String, quiet: bool, stop: usize,
-    system: String, temp: f32, top_p: f32, top_k: usize, seed: u64, hide_thinking: bool, n_set: bool,
-}
 
 fn parse() -> (String, Opts) {
     let mut args = std::env::args().skip(1);
     let cmd = args.next().unwrap_or_else(|| "help".into());
     let home = std::env::var("HOME").unwrap_or_default();
-    let mut o = Opts { model: DEFAULT_MODEL.replace('~', &home), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
+    let mut o = Opts { model: DEFAULT_MODEL.replace('~', &home), prompt: "Write a haiku about the ocean.".into(), prompt_file: None, n: 2048, ctx: 16384,
                        raw: false, effort: "high".into(), reference: String::new(), quiet: false, stop: 1, system: String::new(),
-                       temp: 1.0, top_p: 0.95, top_k: 64, seed: 0, hide_thinking: false, n_set: false };
+                       temp: 1.0, top_p: 0.95, top_k: 64, seed: 0, seed_set: false, hide_thinking: false, n_set: false, kv8: false, kv_disk: false, json: false };
     while let Some(a) = args.next() {
         let mut v = || args.next().unwrap_or_else(|| { eprintln!("missing value for {a}"); std::process::exit(2) });
         match a.as_str() {
@@ -83,23 +44,6 @@ fn parse() -> (String, Opts) {
     (cmd, o)
 }
 
-/// reasoning effort as rendered by the GGUF chat template
-fn effort_str(e: &str) -> String {
-    let v = match e.trim() {
-        "none" => 0.0, "minimal" => 0.1, "low" => 0.2, "medium" => 0.7, "high" => 0.9, "xhigh" | "max" => 0.99,
-        x => x.parse::<f64>().unwrap_or(0.9).clamp(0.0, 0.99),
-    };
-    if v == 0.0 { "0".into() } else { format!("{v}") }
-}
-
-fn first_turn(o: &Opts, user: &str) -> String {
-    let mut s = String::new();
-    if !o.system.is_empty() { s += &format!("<|message_system|><|content_text|>{}<|end_message|>", o.system); }
-    s += &format!("<|message_system|><|content_text|>Thinking effort level: {}<|end_message|>", effort_str(&o.effort));
-    s += &format!("<|message_user|><|content_text|>{user}<|end_message|>");
-    s
-}
-
 fn softcap(x: f32, c: f32) -> f32 { if c > 0.0 { c * (x / c).tanh() } else { x } }
 
 fn run(o: &Opts) {
@@ -108,8 +52,7 @@ fn run(o: &Opts) {
     if std::env::var("INK_KV_PREALLOC").is_ok() { eng.reserve(o.ctx, false); }     // dev: no cache growth (to compare against)
     let mut sess = Session::new(&eng, &tk);
     let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, o.seed);
-    let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
-    let toks = tk.encode(&text, true);
+    let toks = if o.raw { tk.encode(&o.prompt, true) } else { encode_first_turn(&tk, o, &o.prompt) };
     eng.prepare(toks.len(), toks.len());       // working memory for this prompt, mapped before the prefill starts
     let first = sess.prefill(&toks);
     let mut out = std::io::stdout();
@@ -139,10 +82,9 @@ fn chat(o: &Opts) {
         let line = line.trim_end_matches(['\n', '\r']).to_string();
         if line.trim().is_empty() { break; }
         if line.trim() == "/reset" { sess = Session::new(&eng, &tk); turn = 0; eprintln!("[context cleared]"); continue; }
-        let text = if turn == 0 { first_turn(o, &line) } else { format!("<|message_user|><|content_text|>{line}<|end_message|>") };
+        let toks = if turn == 0 { encode_first_turn(&tk, o, &line) } else { encode_user_turn(&tk, &line) };
         turn += 1;
         let before = sess.stats;
-        let toks = tk.encode(&text, true);
         if sess.ctx_left() < toks.len() + 64 { eprintln!("[context full: /reset]"); continue; }
         let first = sess.prefill(&toks);
         let mut r = Renderer::new(!o.hide_thinking, o.raw);
@@ -162,8 +104,7 @@ fn bench(o: &Opts) {
     if let Ok(v) = std::env::var("INK_SKIP") { eng.skip.set(v.parse().unwrap()); }
     let tk = Tokenizer::load(&eng.g);
     let n = if o.n_set { o.n } else { 128 };
-    let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
-    let toks = tk.encode(&text, true);
+    let toks = if o.raw { tk.encode(&o.prompt, true) } else { encode_first_turn(&tk, o, &o.prompt) };
     let mut sampler = Sampler::new(0.0, 1, 1.0, eng.softcap, 0);
     // warm-up pass (pipelines, page mappings)
     { let mut s = Session::new(&eng, &tk); let f = s.prefill(&toks[..toks.len().min(64)]); s.generate(f, 8, &mut sampler, |_| true); }
@@ -234,7 +175,7 @@ fn check(o: &Opts) {
             if pf > 0 && pos + 1 == pf { eng.kv_quant_sim(0, pf, kb, vb); } else { eng.kv_quant_sim(pos, pos + 1, kb, vb); }
         }
         let lg: Vec<f32> = eng.logits().iter().map(|&x| softcap(x, eng.softcap)).collect();
-        for x in eng.logits() { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        for x in eng.logits().iter() { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         if pos < first_ref { continue; }
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
         let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
@@ -330,7 +271,7 @@ fn prof_pf(o: &Opts) {
     eng.set_tokens(0, &(0..8192).map(|i| 1000 + (i * 7) % 5000).collect::<Vec<u32>>());
     if o.prompt.len() > 500 {
         let tk = Tokenizer::load(&eng.g);
-        let pt = tk.encode(&first_turn(o, &o.prompt), true);
+        let pt = encode_first_turn(&tk, o, &o.prompt);
         println!("using prompt ({} tokens)", pt.len());
         eng.set_tokens(0, &pt);
     }
@@ -372,8 +313,7 @@ fn routes(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
     let tk = Tokenizer::load(&eng.g);
-    let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
-    let prompt = tk.encode(&text, true);
+    let prompt = if o.raw { tk.encode(&o.prompt, true) } else { encode_first_turn(&tk, o, &o.prompt) };
     let mut sess = Session::new(&eng, &tk);
     let mut tok = sess.prefill(&prompt);
     let mut out = String::new();
@@ -441,7 +381,7 @@ fn main() {
             eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
             eng.tail.set(false);
             let tk = Tokenizer::load(&eng.g);
-            let pt = tk.encode(&first_turn(&o, &o.prompt), true);
+            let pt = encode_first_turn(&tk, &o, &o.prompt);
             let t = pt.len().min(eng.chunk);
             eng.reset();
             eng.set_tokens(0, &pt);
@@ -525,14 +465,14 @@ fn main() {
             let eng = Engine::load(&o.model, o.ctx);
             eng.tail.set(false);
             let tk = Tokenizer::load(&eng.g);
-            let pt = tk.encode(&first_turn(&o, &o.prompt), true);
+            let pt = encode_first_turn(&tk, &o, &o.prompt);
             let (n, d) = (pt.len(), if o.n_set { o.n } else { 48 });
             eng.reset(); eng.reserve(n + d + 1, false); eng.ensure_batch(n.min(eng.chunk)); eng.qcap_alloc(n);
             eng.set_tokens(0, &pt);
             let mut p0 = 0;
             while p0 < n { let t = (n - p0).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_prefill(&cb, p0, t, p0 + t == n, false); cb.commit(); cb.waitUntilCompleted(); p0 += t; }
             let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
-            let first = am(eng.logits()) as u32;
+            let first = am(&eng.logits()) as u32;
             let snap = eng.snapshot();
             let run = |toks: Option<&[u32]>| -> (Vec<u32>, Vec<Vec<f32>>, f64) {
                 eng.restore(&snap);
@@ -576,7 +516,7 @@ fn main() {
             let eng = Engine::load(&o.model, o.ctx);
             eng.tail.set(false);
             let tk = Tokenizer::load(&eng.g);
-            let pt = tk.encode(&first_turn(&o, &o.prompt), true);
+            let pt = encode_first_turn(&tk, &o, &o.prompt);
             let n = pt.len().min(eng.chunk);
             eng.reset(); eng.reserve(n + 1, false); eng.ensure_batch(n);
             eng.set_tokens(0, &pt);
@@ -590,7 +530,7 @@ fn main() {
             // dev: prefill the prompt and write the K/V payload to <ref>.swa / <ref>.full (to study its redundancy)
             let eng = Engine::load(&o.model, o.ctx);
             let tk = Tokenizer::load(&eng.g);
-            let pt = tk.encode(&first_turn(&o, &o.prompt), true);
+            let pt = encode_first_turn(&tk, &o, &o.prompt);
             let mut sess = Session::new(&eng, &tk);
             sess.prefill(&pt);
             let (swa, full) = eng.kv_dump(pt.len());

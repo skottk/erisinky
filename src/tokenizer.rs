@@ -32,7 +32,13 @@ impl Tokenizer {
         let tok_type = match &g.kv["tokenizer.ggml.token_type"] { Value::AI(v) => v.clone(), _ => panic!("no token types") };
         let merges_s = match &g.kv["tokenizer.ggml.merges"] { Value::AS(v) => v, _ => panic!("no merges") };
         let mut tok_to_id = HashMap::with_capacity(id_to_tok.len() * 2);
-        for (i, t) in id_to_tok.iter().enumerate() { tok_to_id.insert(t.clone(), i as u32); }
+        for (i, t) in id_to_tok.iter().enumerate() {
+            // Exclude special/control tokens (tok_type == 3) from BPE lookup and merges so
+            // `encode(..., false)` can never emit control token IDs.
+            if tok_type.get(i) != Some(&3) {
+                tok_to_id.insert(t.clone(), i as u32);
+            }
+        }
         let mut merges = HashMap::with_capacity(merges_s.len() * 2);
         for (rank, m) in merges_s.iter().enumerate() {
             let (a, b) = m.split_once(' ').expect("bad merge");
@@ -41,7 +47,8 @@ impl Tokenizer {
             }
         }
         let mut specials: Vec<(String, u32)> = id_to_tok.iter().enumerate()
-            .filter(|(i, _)| tok_type[*i] == 3).map(|(i, t)| (t.clone(), i as u32)).collect();
+            .filter(|(i, t)| tok_type.get(*i) == Some(&3) && !t.is_empty())
+            .map(|(i, t)| (t.clone(), i as u32)).collect();
         specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
         // GPT-2 byte <-> unicode mapping
         let mut byte_to_id = [0u32; 256];
@@ -59,6 +66,11 @@ impl Tokenizer {
     }
 
     pub fn is_special(&self, id: u32) -> bool { self.tok_type.get(id as usize) == Some(&3) }
+
+    /// Look up the token ID of a special/control token (`tok_type == 3`) by exact string.
+    pub fn special_id(&self, tok: &str) -> Option<u32> {
+        self.specials.iter().find(|(s, _)| s == tok).map(|&(_, id)| id)
+    }
 
     /// Raw bytes of one token (special tokens rendered literally).
     pub fn decode_bytes(&self, id: u32) -> Vec<u8> {

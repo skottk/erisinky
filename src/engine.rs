@@ -91,9 +91,58 @@ pub const KERNELS: &[&str] = &[
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct EmbedArgs { emb_lo: u32, emb_hi: u32, row_bytes: u32, norm_off: u32, out0: u32, out1: u32, tok_index: u32, eps: f32 }
 
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct MixJob { n_s: u32, n_q: u32, s_off: [u32; 6], q_off: i32, out_off: [u32; 4], norm_off: [i32; 4], eps: f32, tstride: u32, ncopy: [[i32; 3]; 4], ntok: u32,
-                 hcopy: [[i32; 3]; 4], hout: [i32; 4], hstride: u32, nof32: u32 }
+#[repr(C)] #[derive(Clone, Copy, Default, Debug)]
+pub struct MixJob {
+    pub n_s: u32, pub n_q: u32, pub s_off: [u32; 6], pub q_off: i32,
+    pub out_off: [u32; 4], pub norm_off: [i32; 4], pub eps: f32, pub tstride: u32,
+    pub ncopy: [[i32; 3]; 4], pub ntok: u32,
+    pub hcopy: [[i32; 3]; 4], pub hout: [i32; 4], pub hstride: u32, pub nof32: u32,
+}
+
+fn mix_b_kernel(j: &MixJob) -> Option<&'static str> {
+    if j.q_off < 0 {
+        return (j.n_s >= 1).then_some("k_mix_b_id");
+    }
+    match (j.n_s, j.n_q) {
+        (1, 1) => Some("k_mix_b_1_1"), (2, 1) => Some("k_mix_b_2_1"), (3, 1) => Some("k_mix_b_3_1"),
+        (4, 1) => Some("k_mix_b_4_1"), (5, 1) => Some("k_mix_b_5_1"), (6, 1) => Some("k_mix_b_6_1"),
+        (1, 3) => Some("k_mix_b_1_3"), (2, 3) => Some("k_mix_b_2_3"), (3, 3) => Some("k_mix_b_3_3"),
+        (4, 3) => Some("k_mix_b_4_3"), (5, 3) => Some("k_mix_b_5_3"), (6, 3) => Some("k_mix_b_6_3"),
+        (1, 4) => Some("k_mix_b_1_4"), (2, 4) => Some("k_mix_b_2_4"), (3, 4) => Some("k_mix_b_3_4"),
+        (4, 4) => Some("k_mix_b_4_4"), (5, 4) => Some("k_mix_b_5_4"), (6, 4) => Some("k_mix_b_6_4"),
+        _ => None,
+    }
+}
+
+/// Dispatch depth-attention mix jobs on `e` (buffer 1 = PB, buffer 2 = A must already be bound).
+pub fn dispatch_mix_jobs(gpu: &Gpu, e: &Enc, jobs: &[MixJob], t: usize, old_mixb: bool) {
+    if jobs.is_empty() || t == 0 { return; }
+    // Plain T=1 decode (no fp16 outputs / nof32) runs `k_mix` (768 threads/job, ~2-3x faster
+    // than `k_mix_b_*` at t == 1). Batched prefill (t > 1) and fp16 1-token prefill (e.g.
+    // 4096k+1 tail chunks) run `k_mix_b_*` so T=1 prefill is bit-identical to batched prefill,
+    // while `k_mix` also implements `hout`/`hcopy`/`nof32` for `INK_OLD_MIXB=1` and fallbacks.
+    let uses_half = jobs.iter().any(|j| {
+        j.nof32 != 0
+            || j.hout.iter().any(|&h| h >= 0)
+            || j.hcopy.iter().any(|r| r.iter().any(|&h| h >= 0))
+    });
+    if (t > 1 || uses_half) && !old_mixb && jobs.iter().all(|j| mix_b_kernel(j).is_some()) {
+        // independent jobs run concurrently (no barrier between them)
+        for j in jobs {
+            let j = MixJob { ntok: t as u32, ..*j };
+            let name = mix_b_kernel(&j).unwrap();
+            e.pso(&gpu.pso(name));
+            e.bytes(&j, 5);
+            e.dispatch((t.div_ceil(4), 1, 1), 128);
+        }
+        e.barrier();
+        return;
+    }
+    e.pso(&gpu.pso("k_mix"));
+    e.bytes_slice(jobs, 5);
+    e.dispatch((jobs.len(), t, 1), 768);
+    e.barrier();
+}
 
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct Seg {
@@ -342,9 +391,123 @@ impl VecAlloc {
     }
 }
 
+/// Zero-copy read-only guard over the engine's output logits inside `act`.
+///
+/// Holds the `RefCell<Buf>` borrow for the entire lifetime of the slice so
+/// `ensure_batch`, `release_batch`, and `prepare` cannot reallocate and drop
+/// the backing `MTLBuffer` while logits are still borrowed.
+pub struct Logits<'a> {
+    buf: std::cell::Ref<'a, Buf>,
+    off: usize,
+    len: usize,
+}
+
+impl<'a> Logits<'a> {
+    /// Construct a bounds-checked `Logits` guard over `buf` starting at `off` `f32` elements
+    /// with length `len`.
+    pub fn new(buf: std::cell::Ref<'a, Buf>, off: usize, len: usize) -> Self {
+        let cap_f32 = buf.length() / std::mem::size_of::<f32>();
+        let end = off
+            .checked_add(len)
+            .expect("logits offset + length overflow");
+        assert!(
+            end <= cap_f32,
+            "logits slice [{off}..{end}) exceeds activation buffer capacity {cap_f32} f32s"
+        );
+        Self { buf, off, len }
+    }
+}
+
+impl std::ops::Deref for Logits<'_> {
+    type Target = [f32];
+
+    #[inline]
+    fn deref(&self) -> &[f32] {
+        let base = self.buf.contents().as_ptr() as *const f32;
+        // SAFETY: `self.buf` keeps the shared `RefCell<Buf>` borrow alive for `&self`,
+        // Metal `StorageModeShared` buffers are page-aligned (>= align_of::<f32>()), and
+        // `Logits::new` verified `self.off + self.len <= self.buf.length() / 4`.
+        unsafe { std::slice::from_raw_parts(base.add(self.off), self.len) }
+    }
+}
+
+impl AsRef<[f32]> for Logits<'_> {
+    #[inline]
+    fn as_ref(&self) -> &[f32] {
+        self
+    }
+}
+
+/// Enable macOS `F_NOCACHE` (uncached I/O) on an open file descriptor and check the return value.
+pub fn set_fd_nocache(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: `libc::fcntl` with `F_NOCACHE` takes a single `c_int` argument (`1`).
+    // Invalid descriptors return `-1` with `EBADF`, which is checked immediately below.
+    let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Create a private (`0o600`), symlink-resistant, immediately-unlinked temporary file
+/// in `dir` for the `--kv-disk` KV-cache tier, with `F_NOCACHE` enabled.
+pub fn create_kv_disk_file_in(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+
+    for _ in 0..64 {
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut rand_bytes = [0u8; 16];
+        // SAFETY: `rand_bytes` is a valid, writable 16-byte stack buffer; `arc4random_buf`
+        // fills it with CSPRNG bytes and never fails on macOS/BSD.
+        unsafe {
+            libc::arc4random_buf(rand_bytes.as_mut_ptr() as *mut libc::c_void, rand_bytes.len());
+        }
+        let hi = u64::from_ne_bytes(rand_bytes[..8].try_into().unwrap());
+        let lo = u64::from_ne_bytes(rand_bytes[8..].try_into().unwrap());
+        let name = format!("inkling-kv-{pid}-{seq}-{hi:016x}{lo:016x}.bin");
+        let path = dir.join(name);
+
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => {
+                // Unlink immediately while the FD stays open so no file remains on disk
+                // even if the process aborts or crashes.
+                std::fs::remove_file(&path)?;
+                // Uncached I/O: the point of the file is that its contents stay out of RAM.
+                set_fd_nocache(file.as_raw_fd())?;
+                return Ok(file);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to create unique kv-disk temporary file after 64 attempts",
+    ))
+}
+
 pub struct Engine {
-    pub g: Gguf,
-    pub gpu: Gpu,
+    // SAFETY (drop order): Rust drops struct fields in declaration order AFTER `Drop::drop`.
+    // 1. `Engine::drop` first waits on all pending tier/GPU command buffers (`gpu.drain()`).
+    // 2. All Metal buffers (`w`, `pb`, `cs`, `toks`, `ctr`, `act`, `kv_swa`, `kv_full`, `tier`,
+    //    `qcap`, `prune`) drop next — critically releasing `w` (a no-copy `MTLBuffer` aliasing
+    //    `g`'s mmap) before `g` is unmapped.
+    // 3. `gpu` drops after all buffers (and drains any remaining tracked command buffers).
+    // 4. `g: Gguf` MUST remain the LAST field so `Gguf::drop` (`libc::munmap`) executes only
+    //    after all GPU work has finished and `w` + `gpu` have been dropped.
     w: Buf, pub pb: Buf, cs: Buf, pub toks: Buf, ctr: Buf,
     /// activations: the small decode arena, followed by the batch (prefill) arena while a prefill needs one
     act: std::cell::RefCell<Buf>,
@@ -369,9 +532,33 @@ pub struct Engine {
     pub max_ctx: usize,
     pub n_vocab: usize,
     eps: f32, log_alpha: f32, log_floor: f32, situ_beta: f32, situ_lbeta: f32, wscale: f32, pub softcap: f32,
+    pub gpu: Gpu,
+    /// Backing mmapped GGUF file — MUST stay last so `munmap` runs after `w` and `gpu` drop.
+    pub g: Gguf,
 }
 
-fn slot_of(pass: usize, ip: usize) -> usize {
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Some(ref t) = self.tier {
+            if let Ok(mut pending) = t.pending.try_borrow_mut() {
+                for p in pending.iter_mut() {
+                    if let Some(cb) = p.take() {
+                        let st = cb.status();
+                        if st != objc2_metal::MTLCommandBufferStatus::NotEnqueued
+                            && st != objc2_metal::MTLCommandBufferStatus::Completed
+                            && st != objc2_metal::MTLCommandBufferStatus::Error
+                        {
+                            cb.waitUntilCompleted();
+                        }
+                    }
+                }
+            }
+        }
+        self.gpu.drain();
+    }
+}
+
+pub fn slot_of(pass: usize, ip: usize) -> usize {
     if pass == 0 || !(LOOP_START..LOOP_END).contains(&ip) { ip } else { N_PHYS + (pass - 1) * (LOOP_END - LOOP_START) + (ip - LOOP_START) }
 }
 
@@ -379,22 +566,37 @@ impl Engine {
     pub fn load(path: &str, max_ctx: usize) -> Engine { Engine::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed)) }
     /// `kv8`: keep the K/V cache as 8-bit integers with a per-vector scale (half the memory, not exact) instead of fp16
     pub fn load_with(path: &str, max_ctx: usize, kv8: bool) -> Engine {
+        Self::try_load_with(path, max_ctx, kv8).expect("load engine")
+    }
+
+    /// Fallible version of `load_with` that validates the GGUF architecture, tensor shapes,
+    /// quantization types, and byte bounds via `Gguf::validate_inkling_model()` before
+    /// allocating any Metal resources.
+    pub fn try_load_with(path: &str, max_ctx: usize, kv8: bool) -> std::io::Result<Engine> {
         let t0 = std::time::Instant::now();
-        let g = Gguf::open(path).expect("open gguf");
-        let arch = match &g.kv["general.architecture"] { Value::S(s) => s.clone(), _ => String::new() };
-        assert_eq!(arch, "inkling2_loop", "unsupported architecture {arch}");
+        let g = Gguf::open(path)?;
+        g.validate_inkling_model()?;
+        if max_ctx == 0 || !max_ctx.is_multiple_of(64) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("context size ({max_ctx}) must be a non-zero multiple of 64"),
+            ));
+        }
+        let chunk: usize = std::env::var("INK_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).min(max_ctx);
+        if chunk == 0 || !chunk.is_multiple_of(32) || chunk > 4096 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid INK_CHUNK ({chunk}): must be a non-zero multiple of 32 <= 4096"),
+            ));
+        }
+        if KV_DISK.load(std::sync::atomic::Ordering::Relaxed) && kv8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--kv-disk keeps the exact fp16 cache; it cannot be combined with --kv8",
+            ));
+        }
         let a = |k: &str| format!("inkling2_loop.{k}");
-        assert_eq!(g.u(&a("embedding_length")) as usize, E);
-        assert_eq!(g.u(&a("block_count")) as usize, N_PHYS);
-        assert_eq!(g.u(&a("expert_count")) as usize, NEXP);
-        assert_eq!(g.u(&a("expert_used_count")) as usize, TOPK);
-        assert_eq!(g.u(&a("loop.start")) as usize, LOOP_START);
-        assert_eq!(g.u(&a("loop.end")) as usize, LOOP_END);
-        assert_eq!(g.u(&a("loop.count")) as usize, N_PASS);
-        assert_eq!(g.u(&a("attn_res.block_size")) as usize, BLOCK);
-        assert_eq!(g.u(&a("attention.sliding_window")) as usize, EXT);
-        assert_eq!(g.u(&a("attention.relative_extent")) as usize, EXT);
-        let swa_pat = match &g.kv[&a("attention.sliding_window_pattern")] { Value::AB(v) => v.clone(), _ => panic!("swa pattern") };
+        let swa_pat = match &g.kv[&a("attention.sliding_window_pattern")] { Value::AB(v) => v.clone(), _ => unreachable!("validated by validate_inkling_model") };
 
         let mut pb = Pb { data: Vec::new() };
         let mut layers = Vec::new();
@@ -462,15 +664,15 @@ impl Engine {
         let src = format!("{}{}\n{}\n{}", if kv8 { "#define KV8 1\n" } else { "" }, include_str!("kernels.metal"), include_str!("prefill.metal"), include_str!("bench_kernels.metal"));
         let kvb = if kv8 { 1 } else { 2 };
         let gpu = Gpu::new(&src, KERNELS);
-        let w = gpu.buffer_nocopy(g.map, g.map_len);
+        let (map_ptr, map_len) = g.raw_map().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "GGUF must be backed by mmap")
+        })?;
+        let w = gpu.buffer_nocopy(map_ptr, map_len);
         pb.data.extend(std::iter::repeat(0u8).take(128 * NREL * 4));   // k_attn_h reads up to 95 rows past a relative-bias table
         let pbuf = gpu.buffer_with(&pb.data);
 
         let max_split = MAX_SPLIT;
         let ar = Arena::new(max_split, n_vocab_pad);
-        let chunk: usize = std::env::var("INK_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).min(max_ctx);
-        assert!(chunk % 32 == 0 && chunk <= 4096);
-        assert!(max_ctx % 64 == 0, "context size must be a multiple of 64");
         // the batch arena is allocated when a prefill needs it and released when generation starts
         let act = gpu.buffer(ar.total as usize * 4);
         // K/V cache layout: per slot [K: NKV x cap x HD][V: NKV x cap x HD] halfs, sliding-window and full slots in separate
@@ -481,7 +683,16 @@ impl Engine {
             let phys = if s < N_PHYS { s } else { LOOP_START + (s - N_PHYS) % (LOOP_END - LOOP_START) };
             if layers[phys].swa { slot_kind.push((true, n_swa)); n_swa += 1; } else { slot_kind.push((false, n_full)); n_full += 1; }
         }
-        assert!(n_full * 2 * NKV * max_ctx * HD < u32::MAX as usize, "KV cache too large for 32-bit offsets");
+        let kv_full_elems = n_full
+            .checked_mul(2 * NKV * HD)
+            .and_then(|v| v.checked_mul(max_ctx))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "KV cache size overflow"))?;
+        if kv_full_elems >= u32::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "KV cache too large for 32-bit offsets",
+            ));
+        }
         let cap0 = KV_CAP0.min(max_ctx);
         let kv_swa = gpu.buffer(n_swa * 2 * NKV * cap0 * HD * kvb);
         let kv_full = gpu.buffer(n_full * 2 * NKV * cap0 * HD * kvb);
@@ -491,12 +702,7 @@ impl Engine {
         eprintln!("[inkling] loaded {} ({:.1} GiB mapped, {:.1} MiB params) in {:.2?}",
             path.rsplit('/').next().unwrap_or(path), g.file_len as f64 / (1u64 << 30) as f64, pb.data.len() as f64 / (1 << 20) as f64, t0.elapsed());
         let tier = if KV_DISK.load(std::sync::atomic::Ordering::Relaxed) {
-            assert!(!kv8, "--kv-disk keeps the exact fp16 cache; it cannot be combined with --kv8");
-            let path = std::env::temp_dir().join(format!("inkling-kv-{}.bin", std::process::id()));
-            let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).expect("create the K/V file");
-            // uncached I/O: the point of the file is that its contents are NOT in memory
-            unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_NOCACHE, 1); }
-            let _ = std::fs::remove_file(&path);       // it lives as long as the process
+            let file = create_kv_disk_file_in(&std::env::temp_dir())?;
             Some(Tier { file, on: Cell::new(false), lo: Default::default(), cold: Default::default(), filed: Default::default(), next: Cell::new(0),
                         min_n: std::env::var("INK_TIER_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
                         stg: RefCell::new(gpu.buffer(16384)), half: Cell::new(0), pending: RefCell::new([None, None]),
@@ -511,7 +717,7 @@ impl Engine {
             situ_lbeta: g.f(&a("activation.situ_linear_beta")) as f32,
             wscale: g.f(&a("expert_weights_scale")) as f32,
             softcap: g.f(&a("final_logit_softcapping")) as f32,
-            g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act), kv_swa: std::cell::RefCell::new(kv_swa), kv_full: std::cell::RefCell::new(kv_full),
+            w, pb: pbuf, act: std::cell::RefCell::new(act), kv_swa: std::cell::RefCell::new(kv_swa), kv_full: std::cell::RefCell::new(kv_full),
             swa_cap: std::cell::Cell::new(cap0), full_cap: std::cell::Cell::new(cap0), slot_kind, tier, qcap: RefCell::new(None), prune: RefCell::new(None), cs, toks, ctr, layers, loops, tok_embd, tok_norm, output, output_norm, output_res_query,
             ar, kv8, kvb, ba: Default::default(), chunk, tensor: std::env::var("INK_NO_TENSOR").is_err(),
             hgemm: std::env::var("INK_NO_HGEMM").is_err() && std::env::var("INK_NO_TENSOR").is_err(),
@@ -520,6 +726,7 @@ impl Engine {
             skip: Default::default(), stop: std::cell::Cell::new(usize::MAX), done: std::cell::Cell::new(0),
             last_out: Default::default(), last_mid: Default::default(),
             max_ctx, n_vocab,
+            gpu, g,
         };
         let mut eng = eng;
         eng.ensure_batch(64);
@@ -530,7 +737,7 @@ impl Engine {
             eng.hgemm = false;
         }
         if std::env::var("INK_NO_WARM").is_err() { eng.warm(); }
-        eng
+        Ok(eng)
     }
 
     /// (k_base, v_base, cap) of a slot's K/V inside its buffer (offsets in cache elements: fp16, or bytes with --kv8)
@@ -1213,8 +1420,8 @@ impl Engine {
         true
     }
     pub fn token_at(&self, i: usize) -> u32 { unsafe { *(self.toks.contents().as_ptr() as *const i32).add(i) as u32 } }
-    pub fn logits(&self) -> &[f32] {
-        unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(self.ar.logits as usize), self.n_vocab) }
+    pub fn logits(&self) -> Logits<'_> {
+        Logits::new(self.act.borrow(), self.ar.logits as usize, self.n_vocab)
     }
 
     /// micro-benchmark a Q4_K matvec variant over the gate_up expert weights of every layer (no cache reuse)
@@ -1575,22 +1782,7 @@ impl Engine {
     fn mix(&self, e: &Enc, cls: u32, jobs: &[MixJob]) { self.mix_t(e, cls, jobs, 1); }
     fn mix_t(&self, e: &Enc, cls: u32, jobs: &[MixJob], t: usize) {
         if self.skip.get() & (1 << cls) != 0 { return; }
-        if t > 1 && std::env::var("INK_OLD_MIXB").is_err() {
-            // independent jobs run concurrently (no barrier between them)
-            for j in jobs {
-                let j = MixJob { ntok: t as u32, ..*j };
-                let name = if j.q_off < 0 { "k_mix_b_id".to_string() } else { format!("k_mix_b_{}_{}", j.n_s, j.n_q) };
-                e.pso(&self.gpu.pso(&name));
-                e.bytes(&j, 5);
-                e.dispatch((t.div_ceil(4), 1, 1), 128);
-            }
-            e.barrier();
-            return;
-        }
-        e.pso(&self.gpu.pso("k_mix"));
-        e.bytes_slice(jobs, 5);
-        e.dispatch((jobs.len(), t, 1), 768);
-        e.barrier();
+        dispatch_mix_jobs(&self.gpu, e, jobs, t, std::env::var("INK_OLD_MIXB").is_ok());
     }
     fn mix_job(&self, states: &[usize], q_off: i32, n_q: u32, outs: &[u32], norms: &[i32]) -> MixJob {
         let offs: Vec<u32> = states.iter().map(|&s| Arena::vec(s)).collect();
