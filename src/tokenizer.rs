@@ -76,6 +76,16 @@ impl Tokenizer {
 
     pub fn is_special(&self, id: u32) -> bool { self.tok_type.get(id as usize) == Some(&3) }
 
+    /// Total number of tokens in the loaded vocabulary.
+    pub fn vocab_size(&self) -> usize {
+        self.id_to_tok.len()
+    }
+
+    /// All special/control tokens `(literal, id)` (`tok_type == 3`), sorted longest-first.
+    pub fn specials(&self) -> &[(String, u32)] {
+        &self.specials
+    }
+
     /// Look up the token ID of a special/control token (`tok_type == 3`) by exact string.
     pub fn special_id(&self, tok: &str) -> Option<u32> {
         self.specials.iter().find(|(s, _)| s == tok).map(|&(_, id)| id)
