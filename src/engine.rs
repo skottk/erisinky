@@ -458,6 +458,231 @@ impl AsRef<[f32]> for Logits<'_> {
     }
 }
 
+/// Borrowed mutable view of the engine's last-step logits inside the activation buffer.
+///
+/// Holds the `RefCell<Buf>` mutable borrow for the entire lifetime of the slice so
+/// callers (such as grammar/JSON-schema logit masks) can modify logits in place with
+/// zero copy while preventing buffer reallocation (`ensure_batch`, `release_batch`,
+/// `prepare`) or aliasing borrows until the guard is dropped.
+pub struct LogitsMut<'a> {
+    buf: std::cell::RefMut<'a, Buf>,
+    off: usize,
+    len: usize,
+}
+
+impl<'a> LogitsMut<'a> {
+    /// Construct a bounds-checked `LogitsMut` guard over `buf` starting at `off` `f32` elements
+    /// with length `len`.
+    pub fn new(buf: std::cell::RefMut<'a, Buf>, off: usize, len: usize) -> Self {
+        let cap_f32 = buf.length() / std::mem::size_of::<f32>();
+        let end = off
+            .checked_add(len)
+            .expect("logits offset + length overflow");
+        assert!(
+            end <= cap_f32,
+            "logits slice [{off}..{end}) exceeds activation buffer capacity {cap_f32} f32s"
+        );
+        Self { buf, off, len }
+    }
+}
+
+impl std::ops::Deref for LogitsMut<'_> {
+    type Target = [f32];
+
+    #[inline]
+    fn deref(&self) -> &[f32] {
+        let base = self.buf.contents().as_ptr() as *const f32;
+        // SAFETY: `self.buf` holds the exclusive `RefCell<Buf>` borrow for `&self`,
+        // Metal `StorageModeShared` buffers are page-aligned (>= align_of::<f32>()), and
+        // `LogitsMut::new` verified `self.off + self.len <= self.buf.length() / 4`.
+        unsafe { std::slice::from_raw_parts(base.add(self.off), self.len) }
+    }
+}
+
+impl std::ops::DerefMut for LogitsMut<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [f32] {
+        let base = self.buf.contents().as_ptr() as *mut f32;
+        // SAFETY: `self.buf` holds the exclusive `RefCell<Buf>` borrow for `&mut self`,
+        // Metal `StorageModeShared` buffers are page-aligned (>= align_of::<f32>()), and
+        // `LogitsMut::new` verified `self.off + self.len <= self.buf.length() / 4`.
+        unsafe { std::slice::from_raw_parts_mut(base.add(self.off), self.len) }
+    }
+}
+
+impl AsRef<[f32]> for LogitsMut<'_> {
+    #[inline]
+    fn as_ref(&self) -> &[f32] {
+        self
+    }
+}
+
+impl AsMut<[f32]> for LogitsMut<'_> {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [f32] {
+        self
+    }
+}
+
+/// Pure, unit-testable pack/unpack and validation helpers for full hybrid
+/// `(n_past, cs, kv_swa, kv_full)` engine checkpoints.
+pub mod checkpoint {
+    /// Pack the first `active_len` positions from each of `n_blocks` strided KV blocks
+    /// (stride `cap * row_bytes`) into a tightly packed `Vec<u8>`.
+    pub fn kv_pack_stride(
+        active_len: usize,
+        cap: usize,
+        n_blocks: usize,
+        row_bytes: usize,
+        src: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if active_len > cap {
+            return Err(format!(
+                "checkpoint active_len {active_len} exceeds KV buffer capacity {cap}"
+            ));
+        }
+        let src_stride = cap
+            .checked_mul(row_bytes)
+            .ok_or_else(|| "checkpoint source stride overflow".to_string())?;
+        let src_need = n_blocks
+            .checked_mul(src_stride)
+            .ok_or_else(|| "checkpoint source size overflow".to_string())?;
+        if src.len() < src_need {
+            return Err(format!(
+                "checkpoint source buffer too short: {} < {src_need}",
+                src.len()
+            ));
+        }
+        let dst_stride = active_len
+            .checked_mul(row_bytes)
+            .ok_or_else(|| "checkpoint packed stride overflow".to_string())?;
+        let dst_len = n_blocks
+            .checked_mul(dst_stride)
+            .ok_or_else(|| "checkpoint packed size overflow".to_string())?;
+        if dst_len == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = vec![0u8; dst_len];
+        for blk in 0..n_blocks {
+            let s0 = blk * src_stride;
+            let d0 = blk * dst_stride;
+            out[d0..d0 + dst_stride].copy_from_slice(&src[s0..s0 + dst_stride]);
+        }
+        Ok(out)
+    }
+
+    /// Unpack `n_blocks` tightly packed KV blocks (`active_len * row_bytes` each) back into
+    /// a strided destination KV buffer (`cap * row_bytes` per block).
+    pub fn kv_unpack_stride(
+        active_len: usize,
+        cap: usize,
+        n_blocks: usize,
+        row_bytes: usize,
+        packed: &[u8],
+        dst: &mut [u8],
+    ) -> Result<(), String> {
+        if active_len > cap {
+            return Err(format!(
+                "checkpoint restore active_len {active_len} exceeds KV capacity {cap}"
+            ));
+        }
+        let src_stride = active_len
+            .checked_mul(row_bytes)
+            .ok_or_else(|| "checkpoint packed stride overflow".to_string())?;
+        let src_need = n_blocks
+            .checked_mul(src_stride)
+            .ok_or_else(|| "checkpoint packed size overflow".to_string())?;
+        if packed.len() != src_need {
+            return Err(format!(
+                "checkpoint packed KV length mismatch: {} != {src_need}",
+                packed.len()
+            ));
+        }
+        let dst_stride = cap
+            .checked_mul(row_bytes)
+            .ok_or_else(|| "checkpoint destination stride overflow".to_string())?;
+        let dst_need = n_blocks
+            .checked_mul(dst_stride)
+            .ok_or_else(|| "checkpoint destination size overflow".to_string())?;
+        if dst.len() < dst_need {
+            return Err(format!(
+                "checkpoint destination buffer too short: {} < {dst_need}",
+                dst.len()
+            ));
+        }
+        if src_need == 0 {
+            return Ok(());
+        }
+        for blk in 0..n_blocks {
+            let s0 = blk * src_stride;
+            let d0 = blk * dst_stride;
+            dst[d0..d0 + src_stride].copy_from_slice(&packed[s0..s0 + src_stride]);
+        }
+        Ok(())
+    }
+
+    /// Validate metadata compatibility before restoring an [`super::EngineCheckpoint`].
+    pub fn validate_restore_meta(
+        n_past: usize,
+        max_ctx: usize,
+        ckpt_kv8: bool,
+        eng_kv8: bool,
+        ckpt_cs_len: usize,
+        eng_cs_len: usize,
+        ckpt_tokens_len: usize,
+    ) -> Result<(), String> {
+        if ckpt_kv8 != eng_kv8 {
+            return Err(format!(
+                "checkpoint kv8 mode mismatch: checkpoint={ckpt_kv8}, engine={eng_kv8}"
+            ));
+        }
+        if n_past >= max_ctx {
+            return Err(format!(
+                "checkpoint n_past {n_past} exceeds engine max_ctx {max_ctx}"
+            ));
+        }
+        if ckpt_cs_len != eng_cs_len {
+            return Err(format!(
+                "checkpoint conv-state length mismatch: {ckpt_cs_len} != {eng_cs_len}"
+            ));
+        }
+        if ckpt_tokens_len != n_past {
+            return Err(format!(
+                "checkpoint token count mismatch: {ckpt_tokens_len} != n_past ({n_past})"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Complete, capacity-independent snapshot of the hybrid GPU inference state
+/// (`n_past`, causal conv state `cs`, sliding-window `kv_swa`, full-attention `kv_full`,
+/// and resident token IDs `[0..n_past)`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineCheckpoint {
+    pub n_past: usize,
+    pub kv8: bool,
+    cs: Vec<u8>,
+    kv_swa: Vec<u8>,
+    kv_full: Vec<u8>,
+    tokens: Vec<u32>,
+}
+
+impl EngineCheckpoint {
+    /// Total heap bytes held by this checkpoint.
+    pub fn byte_size(&self) -> usize {
+        self.cs.len()
+            + self.kv_swa.len()
+            + self.kv_full.len()
+            + self.tokens.len() * std::mem::size_of::<u32>()
+    }
+
+    /// Resident token IDs `[0..n_past)` captured by this checkpoint.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+}
+
 /// Enable macOS `F_NOCACHE` (uncached I/O) on an open file descriptor and check the return value.
 pub fn set_fd_nocache(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     // SAFETY: `libc::fcntl` with `F_NOCACHE` takes a single `c_int` argument (`1`).
@@ -1644,6 +1869,116 @@ impl Engine {
             std::ptr::copy_nonoverlapping(s.1.as_ptr(), kv.contents().as_ptr() as *mut u8, s.1.len());
         }
     }
+
+    /// Capture a complete, capacity-independent hybrid checkpoint of `(n_past, cs, kv_swa, kv_full, tokens)`.
+    /// Nothing may be in flight on the GPU.
+    pub fn checkpoint(&self, n_past: usize) -> Result<EngineCheckpoint, String> {
+        if n_past >= self.max_ctx {
+            return Err(format!(
+                "checkpoint n_past {n_past} exceeds engine max_ctx {}",
+                self.max_ctx
+            ));
+        }
+        if n_past > 0 {
+            self.tier_leave(n_past);
+        }
+        let cs = unsafe {
+            std::slice::from_raw_parts(self.cs.contents().as_ptr() as *const u8, self.cs.length())
+                .to_vec()
+        };
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        let n_full = N_SLOT - n_swa;
+        let row_bytes = HD * self.kvb;
+
+        let swa_len = n_past.min(EXT);
+        let kv_swa = {
+            let buf = self.kv_swa.borrow();
+            let raw = unsafe {
+                std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length())
+            };
+            checkpoint::kv_pack_stride(swa_len, self.swa_cap.get(), n_swa * 2 * NKV, row_bytes, raw)?
+        };
+        let kv_full = {
+            let buf = self.kv_full.borrow();
+            let raw = unsafe {
+                std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, buf.length())
+            };
+            checkpoint::kv_pack_stride(n_past, self.full_cap.get(), n_full * 2 * NKV, row_bytes, raw)?
+        };
+        let mut tokens = Vec::with_capacity(n_past);
+        for i in 0..n_past {
+            tokens.push(self.token_at(i));
+        }
+        Ok(EngineCheckpoint {
+            n_past,
+            kv8: self.kv8,
+            cs,
+            kv_swa,
+            kv_full,
+            tokens,
+        })
+    }
+
+    /// Restore a full hybrid [`EngineCheckpoint`], growing the GPU KV buffers if needed.
+    /// Nothing may be in flight on the GPU.
+    pub fn restore_checkpoint(&self, ckpt: &EngineCheckpoint) -> Result<(), String> {
+        checkpoint::validate_restore_meta(
+            ckpt.n_past,
+            self.max_ctx,
+            ckpt.kv8,
+            self.kv8,
+            ckpt.cs.len(),
+            self.cs.length(),
+            ckpt.tokens.len(),
+        )?;
+        self.tier_reset();
+        if ckpt.n_past > 0 {
+            self.reserve(ckpt.n_past, false);
+        }
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        let n_full = N_SLOT - n_swa;
+        let row_bytes = HD * self.kvb;
+        let swa_len = ckpt.n_past.min(EXT);
+        {
+            let buf = self.kv_swa.borrow_mut();
+            let raw = unsafe {
+                std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, buf.length())
+            };
+            checkpoint::kv_unpack_stride(
+                swa_len,
+                self.swa_cap.get(),
+                n_swa * 2 * NKV,
+                row_bytes,
+                &ckpt.kv_swa,
+                raw,
+            )?;
+        }
+        {
+            let buf = self.kv_full.borrow_mut();
+            let raw = unsafe {
+                std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, buf.length())
+            };
+            checkpoint::kv_unpack_stride(
+                ckpt.n_past,
+                self.full_cap.get(),
+                n_full * 2 * NKV,
+                row_bytes,
+                &ckpt.kv_full,
+                raw,
+            )?;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ckpt.cs.as_ptr(),
+                self.cs.contents().as_ptr() as *mut u8,
+                ckpt.cs.len(),
+            );
+        }
+        if !ckpt.tokens.is_empty() {
+            self.set_tokens(0, &ckpt.tokens);
+        }
+        Ok(())
+    }
     /// Score every far key (older than one window at context `n`) of the full-attention slots by the attention it received
     /// from a sample of the prompt's own queries, keep the best `keep` share per (slot, group) and optionally one summary
     /// key (mean of the evicted keys and values, score bias ln(count)). Returns (far keys, kept per group).
@@ -1902,6 +2237,11 @@ impl Engine {
     }
     pub fn logits(&self) -> Logits<'_> {
         Logits::new(self.act.borrow(), self.ar.logits as usize, self.n_vocab)
+    }
+
+    /// Borrow the last-step logits mutably (zero-copy) for in-place logit hooks / grammar masks.
+    pub fn logits_mut(&self) -> LogitsMut<'_> {
+        LogitsMut::new(self.act.borrow_mut(), self.ar.logits as usize, self.n_vocab)
     }
 
     /// Read a single logit value directly from the activation buffer without copying.

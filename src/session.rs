@@ -1,6 +1,6 @@
 //! A generation session: owns the context (tokens + KV/conv state on the GPU), prefill and decode loops.
 
-use crate::engine::Engine;
+use crate::engine::{Engine, EngineCheckpoint};
 use crate::metal::CmdBuf;
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
@@ -125,6 +125,100 @@ impl<'a> Session<'a> {
         };
         generate_with_backend(self.eng, &mut state, first, max, sampler, on_token)
     }
+
+    /// Return any sampled token awaiting prefill/step ingestion (for example, `eos` at turn end).
+    pub fn pending(&self) -> Option<u32> {
+        self.pending
+    }
+
+    /// Set or clear the pending sampled token. External decode loops should stash the
+    /// terminating token here before returning control so the next `try_prefill` ingests it.
+    pub fn set_pending(&mut self, tok: Option<u32>) {
+        self.pending = tok;
+    }
+
+    /// Advance the model by one autoregressive token step and leave logits ready in
+    /// `self.eng.logits()` / `self.eng.logits_mut()` for external logit hooks and sampling.
+    pub fn try_step(&mut self, tok: u32) -> Result<(), String> {
+        let mut state = DecodeState {
+            eos: self.tk.eos,
+            n_past: &mut self.n_past,
+            pending: &mut self.pending,
+            stats: &mut self.stats,
+        };
+        step_with_backend(self.eng, &mut state, tok)
+    }
+
+    /// Capture a complete hybrid checkpoint (`n_past`, `pending`, conv state, SWA + full KV, tokens).
+    pub fn checkpoint(&self) -> Result<SessionCheckpoint, String> {
+        let engine = self.eng.checkpoint(self.n_past)?;
+        Ok(SessionCheckpoint {
+            n_past: self.n_past,
+            pending: self.pending,
+            engine,
+        })
+    }
+
+    /// Restore a previously captured [`SessionCheckpoint`].
+    pub fn restore_checkpoint(&mut self, ckpt: &SessionCheckpoint) -> Result<(), String> {
+        self.eng.restore_checkpoint(&ckpt.engine)?;
+        self.n_past = ckpt.n_past;
+        self.pending = ckpt.pending;
+        Ok(())
+    }
+}
+
+/// Complete snapshot of a [`Session`]'s logical cursor (`n_past`, `pending`) and hybrid GPU state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionCheckpoint {
+    pub n_past: usize,
+    pub pending: Option<u32>,
+    engine: EngineCheckpoint,
+}
+
+impl SessionCheckpoint {
+    /// Total heap bytes held by the underlying hybrid checkpoint.
+    pub fn byte_size(&self) -> usize {
+        self.engine.byte_size()
+    }
+
+    /// Resident token IDs `[0..n_past)` captured by this checkpoint.
+    pub fn tokens(&self) -> &[u32] {
+        self.engine.tokens()
+    }
+}
+
+/// Validate that one additional autoregressive token step fits in `max_ctx`.
+pub fn validate_step(n_past: usize, max_ctx: usize) -> Result<usize, String> {
+    let end = n_past
+        .checked_add(1)
+        .ok_or_else(|| "context length overflow".to_string())?;
+    if end >= max_ctx {
+        return Err(format!(
+            "context full ({max_ctx} tokens; cannot step at position {n_past})"
+        ));
+    }
+    Ok(end)
+}
+
+/// Single-token autoregressive decode step shared by [`Session::try_step`] and unit tests.
+pub fn step_with_backend<B: DecodeBackend>(
+    eng: &B,
+    state: &mut DecodeState<'_>,
+    tok: u32,
+) -> Result<(), String> {
+    let end = validate_step(*state.n_past, eng.max_ctx())?;
+    let t0 = Instant::now();
+    *state.pending = None;
+    eng.release_batch();
+    eng.set_token(*state.n_past, tok);
+    eng.gen_reserve(*state.n_past);
+    let cb = eng.launch_step(*state.n_past, false);
+    eng.wait_step(&cb);
+    *state.n_past = end;
+    state.stats.gen_tokens += 1;
+    state.stats.gen_time += t0.elapsed();
+    Ok(())
 }
 
 /// RAII guard for a single Metal command buffer in [`DecodeBackend`].
