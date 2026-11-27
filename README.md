@@ -32,7 +32,7 @@ Options: `--effort none|minimal|low|medium|high|xhigh`, `--temp/--top-p/--top-k/
 `--hide-thinking`, `--raw`, `--kv-disk` (half of the exact K/V cache in memory, the rest streamed from SSD: slower
 generation, bit-identical output), `--kv8` (half-size 8-bit K/V cache, not exact - both in the limits section),
 `-m model.gguf` (default: LM Studio's Inkling-2-Mini Q4_K_M). Requires macOS with Metal 4
-(M5 neural accelerators are used for prefill GEMMs and prefill attention).
+(prefill GEMMs and prefill attention use M5 neural accelerators or M4 8x8 matrix units).
 
 ## The model (what had to be implemented)
 
@@ -105,6 +105,17 @@ floor at the measured ~290 GB/s is ~11 ms/token. The engine runs at ~15.9 ms; ll
     conv state, so its queries, attention, output projection and FFN run for 8 tokens instead of all (K/V still for all).
   Probabilities are carried in fp16 pre-scaled by e^8 — without that, small probabilities underflow fp16 and the first-token
   KL vs llama.cpp was 0.04; with it, 0.0001.
+
+### Prefill on Apple M4 vs. M5
+
+Apple M5 and Apple M4 run Metal 4's batch matrix-multiply operations on different hardware blocks inside the GPU, which changes how intermediate results are distributed across threads:
+
+- **Apple M5** executes them on dedicated **Neural Accelerators**, giving each GPU thread **groups of four** consecutive values at a time.
+- **Apple M4** executes them on its **8×8 matrix units**, giving each GPU thread **pairs of two** consecutive values instead.
+
+Originally, the startup check only recognized M5's four-value arrangement, forcing M4 onto a slower, higher-memory fallback prefill path. Even though M4 distributes values in pairs rather than fours, each thread still holds all of the companion values needed by the fused register epilogues in its own registers—just spaced differently. At load time, the engine now detects whether the GPU arranges results in fours or pairs and selects matching prefill variants that keep all epilogue work in registers with no extra shared-memory traffic.
+
+On an M4 Max, using the native pair-arranged fast path speeds up prompt prefill by roughly **20%** (up to ~1,260 tok/s at 2.5K tokens), reduces peak prefill working memory by about **38%**, and produces identical greedy output. Single-token generation speed is unchanged because decoding is limited by memory bandwidth and uses custom matrix-vector routines rather than batch matrix-multiply units.
 
 ### Things tried that did not help (kept out of the hot path)
 - **Megakernel-style fusion** (inspired by [mvm](https://github.com/Bobliuuu/mvm)): "last threadgroup finishes the job"
